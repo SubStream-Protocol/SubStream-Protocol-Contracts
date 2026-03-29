@@ -69,7 +69,7 @@
                   "i128": "100"
                 },
                 {
-                  "i128": "1"
+                  "i128": "1000000000"
                 }
               ]
             }
@@ -202,37 +202,6 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "CreatorSubscribers"
-                  },
-                  {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "vec": [
-                  {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                  }
-                ]
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 4095
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
-              "key": {
-                "vec": [
-                  {
                     "symbol": "Subscription"
                   },
                   {
@@ -248,10 +217,18 @@
                 "map": [
                   {
                     "key": {
+                      "symbol": "accrued_remainder"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "balance"
                     },
                     "val": {
-                      "i128": "100"
+                      "i128": "100000000000"
                     }
                   },
                   {
@@ -329,7 +306,7 @@
                             "symbol": "rate_per_second"
                           },
                           "val": {
-                            "i128": "1"
+                            "i128": "1000000000"
                           }
                         },
                         {

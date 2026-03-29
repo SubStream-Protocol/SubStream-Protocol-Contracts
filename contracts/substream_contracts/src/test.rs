@@ -1,4 +1,4 @@
-﻿#![cfg(test)]
+#![cfg(test)]
 
 use super::*;
 use soroban_sdk::{
@@ -41,7 +41,7 @@ fn test_is_subscribed_active() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(100);
-    client.subscribe(&subscriber, &creator, &token.address, &1000, &1);
+    client.subscribe(&subscriber, &creator, &token.address, &1000, &1_000_000_000);
 
     env.ledger().set_timestamp(105);
     assert!(client.is_subscribed(&subscriber, &creator));
@@ -64,7 +64,7 @@ fn test_is_subscribed_expired() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(100);
-    client.subscribe(&subscriber, &creator, &token.address, &10, &10);
+    client.subscribe(&subscriber, &creator, &token.address, &10, &10_000_000_000);
 
     env.ledger().set_timestamp(100 + WEEK + 2);
     assert!(!client.is_subscribed(&subscriber, &creator));
@@ -145,7 +145,7 @@ fn test_free_trial_ignores_claims_within_first_week() {
 
     let start = 100u64;
     env.ledger().set_timestamp(start);
-    client.subscribe(&subscriber, &creator, &token.address, &300, &3);
+    client.subscribe(&subscriber, &creator, &token.address, &300, &3_000_000_000);
 
     env.ledger().set_timestamp(start + WEEK - 1);
     client.collect(&subscriber, &creator);
@@ -207,7 +207,7 @@ fn test_cancel_before_minimum_duration() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(100);
-    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1_000_000_000);
 
     env.ledger().set_timestamp(100 + 3600);
     client.cancel(&subscriber, &creator);
@@ -231,7 +231,7 @@ fn test_cancel_after_minimum_duration() {
 
     let start = 100u64;
     env.ledger().set_timestamp(start);
-    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1_000_000_000);
 
     env.ledger().set_timestamp(start + DAY + 10);
     client.cancel(&subscriber, &creator);
@@ -257,7 +257,7 @@ fn test_cancel_exactly_at_minimum_duration() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(100);
-    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1_000_000_000);
 
     env.ledger().set_timestamp(100 + DAY);
     client.cancel(&subscriber, &creator);
@@ -288,7 +288,7 @@ fn test_top_up() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(0);
-    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1_000_000_000);
     assert_eq!(token.balance(&contract_id), 100);
 
     client.top_up(&subscriber, &creator, &50);
@@ -343,7 +343,7 @@ fn test_group_subscribe_and_collect_split() {
         &channel_id,
         &token.address,
         &500,
-        &10,
+        &10_000_000_000,
         &creators,
         &percentages,
     );
@@ -394,7 +394,7 @@ fn test_group_requires_exactly_five_creators() {
         &channel_id,
         &token.address,
         &100,
-        &1,
+        &1_000_000_000,
         &creators,
         &percentages,
     );
@@ -437,7 +437,7 @@ fn test_group_percentages_must_sum_to_100() {
         &channel_id,
         &token.address,
         &100,
-        &1,
+        &1_000_000_000,
         &creators,
         &percentages,
     );
@@ -480,7 +480,7 @@ fn test_group_cancel_collects_and_refunds_remaining_balance() {
         &channel_id,
         &token.address,
         &200,
-        &1,
+        &1_000_000_000,
         &creators,
         &percentages,
     );
@@ -592,7 +592,7 @@ fn test_flash_stream_attack_within_single_ledger() {
     env.ledger().set_timestamp(ledger_time);
 
     // Attacker subscribes with minimal amount to bypass content gates
-    client.subscribe(&attacker, &creator, &token.address, &10, &1);
+    client.subscribe(&attacker, &creator, &token.address, &10, &1_000_000_000);
 
     // Check that subscription is active immediately (within same ledger)
     assert!(client.is_subscribed(&attacker, &creator));
@@ -636,7 +636,7 @@ fn test_flash_stream_attack_multiple_quick_subscriptions() {
         let subscriber = Address::generate(&env);
         
         // Subscribe with minimal amount
-        client.subscribe(&subscriber, &creator, &token.address, &5, &1);
+        client.subscribe(&subscriber, &creator, &token.address, &5, &1_000_000_000);
         
         // Verify subscription is active
         assert!(client.is_subscribed(&subscriber, &creator));
@@ -668,7 +668,7 @@ fn test_flash_stream_attack_grace_period_exploitation() {
     env.ledger().set_timestamp(start_time);
 
     // Subscribe with very small amount that will be exhausted quickly
-    client.subscribe(&attacker, &creator, &token.address, &10, &100);
+    client.subscribe(&attacker, &creator, &token.address, &10, &100_000_000_000);
 
     // Fast forward to exhaust funds but stay within grace period
     let exhaust_time = start_time + 10; // 10 seconds later
@@ -686,7 +686,7 @@ fn test_flash_stream_attack_grace_period_exploitation() {
     
     env.ledger().set_timestamp(exhaust_time + 1); // 1 second later
     
-    client.subscribe(&new_attacker, &creator, &token.address, &5, &1);
+    client.subscribe(&new_attacker, &creator, &token.address, &5, &1_000_000_000);
     
     // Both subscriptions should be active (original in grace period, new one active)
     assert!(client.is_subscribed(&attacker, &creator));
@@ -722,7 +722,7 @@ fn test_blacklist_user_prevents_subscription() {
 
     // Attempt to subscribe should fail
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.subscribe(&malicious_user, &creator, &token.address, &100, &1);
+        client.subscribe(&malicious_user, &creator, &token.address, &100, &1_000_000_000);
     }));
 
     assert!(result.is_err());
@@ -754,7 +754,7 @@ fn test_unblacklist_user_allows_subscription() {
     assert!(!client.is_user_blacklisted(&creator, &user));
 
     // Now subscription should work
-    client.subscribe(&user, &creator, &token.address, &100, &1);
+    client.subscribe(&user, &creator, &token.address, &100, &1_000_000_000);
     assert!(client.is_subscribed(&user, &creator));
 }
 
@@ -835,7 +835,7 @@ fn test_blacklist_prevents_group_subscription() {
             &channel_id,
             &token.address,
             &100,
-            &1,
+            &1_000_000_000,
             &creators,
             &percentages,
         );
@@ -871,12 +871,12 @@ fn test_blacklist_only_affects_specific_creator() {
 
     // Subscription to creator_1 should fail
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.subscribe(&user, &creator_1, &token.address, &100, &1);
+        client.subscribe(&user, &creator_1, &token.address, &100, &1_000_000_000);
     }));
     assert!(result.is_err());
 
     // Subscription to creator_2 should succeed
-    client.subscribe(&user, &creator_2, &token.address, &100, &1);
+    client.subscribe(&user, &creator_2, &token.address, &100, &1_000_000_000);
     assert!(client.is_subscribed(&user, &creator_2));
 }
 
@@ -898,7 +898,7 @@ fn test_blacklist_with_existing_subscription() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     // User subscribes first
-    client.subscribe(&user, &creator, &token.address, &100, &1);
+    client.subscribe(&user, &creator, &token.address, &100, &1_000_000_000);
     assert!(client.is_subscribed(&user, &creator));
 
     // Creator then blacklists the user
@@ -912,7 +912,7 @@ fn test_blacklist_with_existing_subscription() {
     client.cancel(&user, &creator);
     
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.subscribe(&user, &creator, &token.address, &100, &1);
+        client.subscribe(&user, &creator, &token.address, &100, &1_000_000_000);
     }));
     assert!(result.is_err());
 }

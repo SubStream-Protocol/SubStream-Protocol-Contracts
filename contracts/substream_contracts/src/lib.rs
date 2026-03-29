@@ -1,7 +1,6 @@
 #![no_std]
 #[cfg(test)]
 extern crate std;
-
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Vec};
 
@@ -12,6 +11,7 @@ const GRACE_PERIOD: u64 = 24 * 60 * 60;
 const GENESIS_NFT_ADDRESS: &str = "CAS3J7GYCCX7RRBHAHXDUY3OOWFMTIDDNVGCH6YOY7W7Y7G656H2HHMA";
 const DISCOUNT_BPS: i128 = 2000; 
 const SIX_MONTHS: u64 = 180 * 24 * 60 * 60;
+const PRECISION_MULTIPLIER: i128 = 1_000_000_000;
 
 // --- Helper: Charge Calculation ---
 fn calculate_discounted_charge(start_time: u64, charge_start: u64, now: u64, base_rate: i128) -> i128 {
@@ -74,11 +74,11 @@ pub struct Subscription {
     pub last_collected: u64,
     pub start_time: u64,
     pub last_funds_exhausted: u64,
-    pub free_to_paid_emitted: bool,
-    pub creators: Vec<Address>,
-    pub percentages: Vec<u32>,
+    pub creators: soroban_sdk::Vec<Address>,
+    pub percentages: soroban_sdk::Vec<u32>,
     pub payer: Address,
     pub beneficiary: Address,
+    pub accrued_remainder: i128, // Dust/fractional units that haven't been paid as tokens
 }
 
 #[contracttype]
@@ -232,7 +232,7 @@ impl SubStreamContract {
         TipReceived { user, creator, token, amount }.publish(&env);
     }
 
-    pub fn subscribe_group(env: Env, payer: Address, channel_id: Address, token: Address, amount: i128, rate_per_second: i128, creators: Vec<Address>, percentages: Vec<u32>) {
+    pub fn subscribe_group(env: Env, payer: Address, channel_id: Address, token: Address, amount: i128, rate_per_second: i128, creators: soroban_sdk::Vec<Address>, percentages: soroban_sdk::Vec<u32>) {
         // Validate exactly 5 creators
         if creators.len() != 5 {
             panic!("group channel must contain exactly 5 creators");
@@ -449,17 +449,19 @@ fn distribute_and_collect(env: &Env, beneficiary: &Address, stream_id: &Address,
     }
 
     let available_balance = sub.balance.max(0);
-    let amount_to_payout = amount_to_collect.min(available_balance);
+    let total_accrued = amount_to_collect.saturating_add(sub.accrued_remainder);
+    let amount_to_payout_nano = total_accrued.min(available_balance.saturating_add(sub.accrued_remainder));
+    let amount_to_payout_tokens = amount_to_payout_nano / PRECISION_MULTIPLIER;
 
-    if amount_to_payout > 0 {
+    if amount_to_payout_tokens > 0 {
         let token_client = TokenClient::new(env, &sub.token);
         let creators_len = sub.creators.len();
-        let mut remaining = amount_to_payout;
+        let mut remaining = amount_to_payout_tokens;
 
         for i in 0..creators_len {
             let creator = sub.creators.get(i).unwrap();
             let share = sub.percentages.get(i).unwrap() as i128;
-            let payout = if i + 1 == creators_len { remaining } else { (amount_to_payout * share) / 100 };
+            let payout = if i + 1 == creators_len { remaining } else { (amount_to_payout_tokens * share) / 100 };
             remaining -= payout;
             if payout > 0 {
                 credit_creator_earnings(env, &creator, payout);
@@ -469,6 +471,7 @@ fn distribute_and_collect(env: &Env, beneficiary: &Address, stream_id: &Address,
     }
 
     sub.balance -= amount_to_collect;
+    sub.accrued_remainder = total_accrued - (amount_to_payout_tokens * PRECISION_MULTIPLIER);
     sub.last_collected = now;
     set_subscription(env, &key, &sub);
     amount_to_collect
@@ -482,7 +485,7 @@ fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount
     let token_client = TokenClient::new(env, &sub.token);
     token_client.transfer(&sub.payer, &env.current_contract_address(), &amount);
     
-    sub.balance += amount;
+    sub.balance += amount * PRECISION_MULTIPLIER;
     if sub.balance > 0 { sub.last_funds_exhausted = 0; }
     set_subscription(env, &key, &sub);
     distribute_and_collect(env, beneficiary, stream_id, None);
@@ -500,7 +503,10 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
 
     if sub.balance > 0 {
         let token_client = TokenClient::new(env, &sub.token);
-        token_client.transfer(&env.current_contract_address(), &sub.payer, &sub.balance);
+        let refund_amount = sub.balance / PRECISION_MULTIPLIER;
+        if refund_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &sub.payer, &refund_amount);
+        }
     }
     for i in 0..sub.creators.len() {
         let creator = sub.creators.get(i).unwrap();
@@ -510,7 +516,7 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     env.storage().temporary().remove(&key);
 }
 
-fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: &Address, token: &Address, amount: i128, rate: i128, creators: Vec<Address>, percentages: Vec<u32>) {
+fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: &Address, token: &Address, amount: i128, rate: i128, creators: soroban_sdk::Vec<Address>, percentages: soroban_sdk::Vec<u32>) {
     payer.require_auth();
     let key = subscription_key(beneficiary, stream_id);
     if subscription_exists(env, &key) { panic!("exists"); }
@@ -523,7 +529,7 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
     let sub = Subscription {
         token: token.clone(),
         tier: Tier { rate_per_second: rate, trial_duration: FREE_TRIAL_DURATION },
-        balance: amount,
+        balance: amount * PRECISION_MULTIPLIER,
         last_collected: now,
         start_time: now,
         last_funds_exhausted: 0,
@@ -532,6 +538,7 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
         percentages,
         payer: payer.clone(),
         beneficiary: beneficiary.clone(),
+        accrued_remainder: 0,
     };
     set_subscription(env, &key, &sub);
     for i in 0..creators_for_stats.len() {
@@ -549,3 +556,5 @@ fn is_creator_paused(env: &Env, creator: &Address) -> bool {
 mod test;
 #[cfg(test)]
 mod test_withdrawal_consistency;
+#[cfg(test)]
+mod test_tiny_streams;
