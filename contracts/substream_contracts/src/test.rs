@@ -87,9 +87,10 @@ fn test_balance_depletion_auto_close_at_zero() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     // Subscribe with exactly 100 tokens at 10 per second: exhausts after 10 paid seconds (post-7-day trial)
+    // Rate uses nano-precision: 10 tokens/s = 10 * PRECISION_MULTIPLIER.
     let start = 100u64;
     env.ledger().set_timestamp(start);
-    client.subscribe(&subscriber, &creator, &token.address, &100, &10);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &10_000_000_000);
 
     // One second before balance reaches zero: still subscribed
     env.ledger().set_timestamp(start + WEEK + 9);
@@ -632,9 +633,10 @@ fn test_flash_stream_attack_multiple_quick_subscriptions() {
     for i in 0..5 {
         let ledger_time = base_time + (i * 5); // Each "ledger" is 5 seconds
         env.ledger().set_timestamp(ledger_time);
-        
+
         let subscriber = Address::generate(&env);
-        
+        token_admin.mint(&subscriber, &100); // each new subscriber needs funds to deposit
+
         // Subscribe with minimal amount
         client.subscribe(&subscriber, &creator, &token.address, &5, &1_000_000_000);
         
@@ -937,8 +939,9 @@ fn test_creator_stats_track_direct_stream_lifecycle() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    // rate 3 tokens/s = 3 * PRECISION_MULTIPLIER; 10 s post-trial → 30 tokens earned
     env.ledger().set_timestamp(100);
-    client.subscribe(&subscriber, &creator, &token.address, &300, &3);
+    client.subscribe(&subscriber, &creator, &token.address, &300, &3_000_000_000);
 
     assert_eq!(
         client.creator_stats(&creator),
@@ -964,10 +967,12 @@ fn test_creator_stats_track_direct_stream_lifecycle() {
     env.ledger().set_timestamp(100 + WEEK + DAY + 20);
     client.cancel(&subscriber, &creator);
 
+    // cancel flushes remaining balance (270 tokens) to creator in addition to the
+    // 30 already collected, so total_earned = 30 + 270 = 300.
     assert_eq!(
         client.creator_stats(&creator),
         CreatorStats {
-            total_earned: 30,
+            total_earned: 300,
             lifetime_fans: 1,
             active_fans: 0,
         }

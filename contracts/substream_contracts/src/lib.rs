@@ -87,6 +87,7 @@ pub struct Subscription {
     pub payer: Address,
     pub beneficiary: Address,
     pub accrued_remainder: i128, // Dust/fractional units that haven't been paid as tokens
+    pub free_to_paid_emitted: bool,
 }
 
 #[contracttype]
@@ -118,6 +119,18 @@ pub struct TierChanged {
     #[topic] pub creator: Address,
     pub old_rate: i128,
     pub new_rate: i128,
+}
+
+#[contractevent]
+pub struct UserBlacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
+}
+
+#[contractevent]
+pub struct UserUnblacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
 }
 
 #[contractevent]
@@ -191,7 +204,7 @@ impl SubStreamContract {
     pub fn verify_creator(env: Env, admin: Address, creator: Address) {
         admin.require_auth();
         let stored_admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
-        if admin != stored_admin { panic!("admin only"); }
+        if admin != stored_admin { panic!("only admin can verify creators"); }
 
         env.storage().persistent().set(&DataKey::VerifiedCreator(creator.clone()), &true);
         CreatorVerified { creator, verified_by: admin }.publish(&env);
@@ -570,7 +583,7 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
 
-    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("too early"); }
+    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("cannot cancel: minimum duration not met"); }
 
     distribute_and_collect(env, beneficiary, stream_id, None);
     sub = get_subscription(env, &key); // Refresh after collect
@@ -633,3 +646,5 @@ mod test;
 mod test_withdrawal_consistency;
 #[cfg(test)]
 mod test_tiny_streams;
+#[cfg(test)]
+mod test_multi_tier_upgrade;
