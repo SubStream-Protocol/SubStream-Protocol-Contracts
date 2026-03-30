@@ -9,17 +9,21 @@ use soroban_sdk::{
 // --- Constants ---
 const MINIMUM_FLOW_DURATION: u64 = 86400;
 const FREE_TRIAL_DURATION: u64 = 7 * 24 * 60 * 60;
-const GRACE_PERIOD: u64 = 24 * 60 * 60; 
+const GRACE_PERIOD: u64 = 24 * 60 * 60;
 const GENESIS_NFT_ADDRESS: &str = "CAS3J7GYCCX7RRBHAHXDUY3OOWFMTIDDNVGCH6YOY7W7Y7G656H2HHMA";
-const DISCOUNT_BPS: i128 = 2000; 
+const DISCOUNT_BPS: i128 = 2000;
 const SIX_MONTHS: u64 = 180 * 24 * 60 * 60;
 const TWELVE_MONTHS: u64 = 365 * 24 * 60 * 60;
 const PRECISION_MULTIPLIER: i128 = 1_000_000_000;
-const TTL_THRESHOLD: u32 = 17280; // ~1 day (assuming ~5s ledgers)
-const TTL_BUMP_AMOUNT: u32 = 518400; // ~30 days
+const REFERRAL_REBATE_BPS: i128 = 100; // 1% rebate
 
 // --- Helper: Charge Calculation ---
-fn calculate_discounted_charge(start_time: u64, charge_start: u64, now: u64, base_rate: i128) -> i128 {
+fn calculate_discounted_charge(
+    start_time: u64,
+    charge_start: u64,
+    now: u64,
+    base_rate: i128,
+) -> i128 {
     if now <= charge_start {
         return 0;
     }
@@ -31,12 +35,20 @@ fn calculate_discounted_charge(start_time: u64, charge_start: u64, now: u64, bas
         let elapsed_since_start = current_t.saturating_sub(start_time);
         let periods = elapsed_since_start / SIX_MONTHS;
         let percent_discount = periods * 5;
-        let discount = if percent_discount > 100 { 100 } else { percent_discount };
+        let discount = if percent_discount > 100 {
+            100
+        } else {
+            percent_discount
+        };
 
         let current_rate = base_rate * (100 - discount as i128) / 100;
 
         let next_boundary = start_time + (periods + 1) * SIX_MONTHS;
-        let end_t = if now < next_boundary { now } else { next_boundary };
+        let end_t = if now < next_boundary {
+            now
+        } else {
+            next_boundary
+        };
 
         let duration = (end_t - current_t) as i128;
         total_charge = total_charge.saturating_add(duration.saturating_mul(current_rate));
@@ -63,6 +75,8 @@ pub enum DataKey {
     NFTAwarded(Address, Address), // (beneficiary, stream_id) - For #44
     BlacklistedUser(Address, Address), // (creator, user_to_block)
     CreatorAudience(Address, Address), // (creator, beneficiary)
+    ReferralTracker(Address, Address), // (referrer, referred_user)
+    UserReferrer(Address),             // (referred_user -> referrer)
 }
 
 #[contracttype]
@@ -112,11 +126,21 @@ pub struct CreatorAudience {
     pub has_supported: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferralInfo {
+    pub referrer: Address,
+    pub referral_count: u32,
+    pub total_rebates_earned: i128,
+}
+
 // --- Events ---
 #[contractevent]
 pub struct TierChanged {
-    #[topic] pub subscriber: Address,
-    #[topic] pub creator: Address,
+    #[topic]
+    pub subscriber: Address,
+    #[topic]
+    pub creator: Address,
     pub old_rate: i128,
     pub new_rate: i128,
 }
@@ -135,37 +159,67 @@ pub struct UserUnblacklisted {
 
 #[contractevent]
 pub struct FreeToPaidTierActivated {
-    #[topic] pub subscriber: Address,
-    #[topic] pub creator: Address,
+    #[topic]
+    pub subscriber: Address,
+    #[topic]
+    pub creator: Address,
     pub rate_per_second: i128,
     pub activated_at: u64,
 }
 
 #[contractevent]
 pub struct Subscribed {
-    #[topic] pub subscriber: Address,
-    #[topic] pub creator: Address,
+    #[topic]
+    pub subscriber: Address,
+    #[topic]
+    pub creator: Address,
     pub rate_per_second: i128,
 }
 
 #[contractevent]
 pub struct Unsubscribed {
-    #[topic] pub subscriber: Address,
-    #[topic] pub creator: Address,
+    #[topic]
+    pub subscriber: Address,
+    #[topic]
+    pub creator: Address,
 }
 
 #[contractevent]
 pub struct TipReceived {
-    #[topic] pub user: Address,
-    #[topic] pub creator: Address,
-    #[topic] pub token: Address,
+    #[topic]
+    pub user: Address,
+    #[topic]
+    pub creator: Address,
+    #[topic]
+    pub token: Address,
     pub amount: i128,
 }
 
 #[contractevent]
 pub struct CreatorVerified {
-    #[topic] pub creator: Address,
-    #[topic] pub verified_by: Address,
+    #[topic]
+    pub creator: Address,
+    #[topic]
+    pub verified_by: Address,
+}
+
+#[contractevent]
+pub struct ReferralRegistered {
+    #[topic]
+    pub referrer: Address,
+    #[topic]
+    pub referred_user: Address,
+}
+
+#[contractevent]
+pub struct ReferralRebatePaid {
+    #[topic]
+    pub referrer: Address,
+    #[topic]
+    pub referred_user: Address,
+    #[topic]
+    pub creator: Address,
+    pub amount: i128,
 }
 
 #[contractevent]
@@ -198,45 +252,143 @@ impl SubStreamContract {
         if env.storage().persistent().has(&DataKey::ContractAdmin) {
             panic!("already initialized");
         }
-        env.storage().persistent().set(&DataKey::ContractAdmin, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractAdmin, &admin);
     }
 
     pub fn verify_creator(env: Env, admin: Address, creator: Address) {
         admin.require_auth();
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
-        if admin != stored_admin { panic!("only admin can verify creators"); }
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ContractAdmin)
+            .expect("not initialized");
+        if admin != stored_admin {
+            panic!("admin only");
+        }
 
-        env.storage().persistent().set(&DataKey::VerifiedCreator(creator.clone()), &true);
-        CreatorVerified { creator, verified_by: admin }.publish(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifiedCreator(creator.clone()), &true);
+        CreatorVerified {
+            creator,
+            verified_by: admin,
+        }
+        .publish(&env);
     }
 
     pub fn is_creator_verified(env: Env, creator: Address) -> bool {
-        env.storage().persistent().get(&DataKey::VerifiedCreator(creator)).unwrap_or(false)
+        env.storage()
+            .persistent()
+            .get(&DataKey::VerifiedCreator(creator))
+            .unwrap_or(false)
     }
 
-    pub fn subscribe(env: Env, subscriber: Address, creator: Address, token: Address, amount: i128, rate_per_second: i128) {
-        Self::subscribe_gift(&env, subscriber.clone(), subscriber, creator, token, amount, rate_per_second);
+    pub fn subscribe(
+        env: Env,
+        subscriber: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        rate_per_second: i128,
+        referrer: Option<Address>, // Add optional referrer parameter
+    ) {
+        Self::subscribe_gift(
+            &env,
+            subscriber.clone(),
+            subscriber,
+            creator,
+            token,
+            amount,
+            rate_per_second,
+            referrer,
+        );
     }
 
-    pub fn subscribe_gift(env: &Env, payer: Address, beneficiary: Address, creator: Address, token: Address, amount: i128, rate_per_second: i128) {
-        subscribe_core(env, &payer, &beneficiary, &creator, &token, amount, rate_per_second, vec![env, creator.clone()], vec![env, 100u32]);
+    pub fn subscribe_gift(
+        env: &Env,
+        payer: Address,
+        beneficiary: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        rate_per_second: i128,
+        referrer: Option<Address>, // Add optional referrer parameter
+    ) {
+        // Register referral if provided
+        if let Some(referrer_addr) = referrer {
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::UserReferrer(beneficiary.clone()))
+            {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::UserReferrer(beneficiary.clone()), &referrer_addr);
+
+                // Update referrer's tracking info
+                let referral_tracker_key =
+                    DataKey::ReferralTracker(referrer_addr.clone(), beneficiary.clone());
+                env.storage().persistent().set(&referral_tracker_key, &true);
+
+                // Get and update referrer's referral info
+                let mut referral_info = get_referral_info(env, &referrer_addr);
+                referral_info.referral_count += 1;
+                set_referral_info(env, &referrer_addr, &referral_info);
+
+                // Emit event
+                ReferralRegistered {
+                    referrer: referrer_addr.clone(),
+                    referred_user: beneficiary.clone(),
+                }
+                .publish(env);
+            }
+        }
+
+        subscribe_core(
+            env,
+            &payer,
+            &beneficiary,
+            &creator,
+            &token,
+            amount,
+            rate_per_second,
+            vec![env, creator.clone()],
+            vec![env, 100u32],
+        );
     }
 
     pub fn is_subscribed(env: Env, subscriber: Address, creator: Address) -> bool {
         let key = subscription_key(&subscriber, &creator);
-        if !subscription_exists(&env, &key) { return false; }
-        
+        if !subscription_exists(&env, &key) {
+            return false;
+        }
+
         let sub = get_subscription(&env, &key);
-        if sub.tier.rate_per_second <= 0 { return false; }
+        if sub.tier.rate_per_second <= 0 {
+            return false;
+        }
 
         let trial_end = sub.start_time.saturating_add(sub.tier.trial_duration);
-        let charge_start = if sub.last_collected > trial_end { sub.last_collected } else { trial_end };
+        let charge_start = if sub.last_collected > trial_end {
+            sub.last_collected
+        } else {
+            trial_end
+        };
         let now = env.ledger().timestamp();
 
-        if now <= charge_start { return true; }
+        if now <= charge_start {
+            return true;
+        }
 
         // Use the discounted charge logic for consistent "is active" checks
-        let potential_charge = calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
+        let potential_charge = calculate_discounted_charge(
+            sub.start_time,
+            charge_start,
+            now,
+            sub.tier.rate_per_second,
+        );
 
         #[cfg(test)]
         extern crate std as std2;
@@ -244,12 +396,16 @@ impl SubStreamContract {
         std2::eprintln!("IS_SUBSCRIBED DEBUG: start_time={} last_collected={} trial_end={} charge_start={} now={} balance={} potential_charge={}",
             sub.start_time, sub.last_collected, sub.start_time.saturating_add(sub.tier.trial_duration), charge_start, now, sub.balance, potential_charge);
 
-        if sub.balance > potential_charge { return true; }
+        if sub.balance > potential_charge {
+            return true;
+        }
 
         // Grace period check
         if sub.last_funds_exhausted > 0 {
             let grace_period_end = sub.last_funds_exhausted.saturating_add(GRACE_PERIOD);
-            if now <= grace_period_end { return true; }
+            if now <= grace_period_end {
+                return true;
+            }
         }
         false
     }
@@ -268,13 +424,30 @@ impl SubStreamContract {
 
     pub fn tip(env: Env, user: Address, creator: Address, token: Address, amount: i128) {
         user.require_auth();
-        if amount <= 0 || user == creator { panic!("invalid tip"); }
+        if amount <= 0 || user == creator {
+            panic!("invalid tip");
+        }
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&user, &creator, &amount);
-        TipReceived { user, creator, token, amount }.publish(&env);
+        TipReceived {
+            user,
+            creator,
+            token,
+            amount,
+        }
+        .publish(&env);
     }
 
-    pub fn subscribe_group(env: Env, payer: Address, channel_id: Address, token: Address, amount: i128, rate_per_second: i128, creators: soroban_sdk::Vec<Address>, percentages: soroban_sdk::Vec<u32>) {
+    pub fn subscribe_group(
+        env: Env,
+        payer: Address,
+        channel_id: Address,
+        token: Address,
+        amount: i128,
+        rate_per_second: i128,
+        creators: soroban_sdk::Vec<Address>,
+        percentages: soroban_sdk::Vec<u32>,
+    ) {
         // Validate exactly 5 creators
         if creators.len() != 5 {
             panic!("group channel must contain exactly 5 creators");
@@ -287,7 +460,17 @@ impl SubStreamContract {
         if total_percentage != 100 {
             panic!("percentages must sum to 100");
         }
-        subscribe_core(&env, &payer, &payer, &channel_id, &token, amount, rate_per_second, creators, percentages);
+        subscribe_core(
+            &env,
+            &payer,
+            &payer,
+            &channel_id,
+            &token,
+            amount,
+            rate_per_second,
+            creators,
+            percentages,
+        );
     }
 
     pub fn collect_group(env: Env, subscriber: Address, channel_id: Address) {
@@ -299,63 +482,106 @@ impl SubStreamContract {
     }
 
     // --- Blacklist functionality for Issue #25 ---
-    
+
     pub fn blacklist_user(env: Env, creator: Address, user_to_block: Address) {
         creator.require_auth();
-        
+
         let blacklist_key = DataKey::BlacklistedUser(creator.clone(), user_to_block.clone());
-        
+
         // Check if already blacklisted
         if env.storage().persistent().has(&blacklist_key) {
             panic!("user already blacklisted");
         }
-        
+
         // Add to blacklist
         env.storage().persistent().set(&blacklist_key, &true);
-        
+
         // Emit event
-        UserBlacklisted { creator, user: user_to_block }.publish(&env);
+        UserBlacklisted {
+            creator,
+            user: user_to_block,
+        }
+        .publish(&env);
     }
-    
+
     pub fn unblacklist_user(env: Env, creator: Address, user_to_unblock: Address) {
         creator.require_auth();
-        
+
         let blacklist_key = DataKey::BlacklistedUser(creator.clone(), user_to_unblock.clone());
-        
+
         // Check if user is actually blacklisted
         if !env.storage().persistent().has(&blacklist_key) {
             panic!("user not blacklisted");
         }
-        
+
         // Remove from blacklist
         env.storage().persistent().remove(&blacklist_key);
-        
+
         // Emit event
-        UserUnblacklisted { creator, user: user_to_unblock }.publish(&env);
+        UserUnblacklisted {
+            creator,
+            user: user_to_unblock,
+        }
+        .publish(&env);
     }
-    
+
     pub fn is_user_blacklisted(env: Env, creator: Address, user: Address) -> bool {
         let blacklist_key = DataKey::BlacklistedUser(creator, user);
-        env.storage().persistent().get(&blacklist_key).unwrap_or(false)
+        env.storage()
+            .persistent()
+            .get(&blacklist_key)
+            .unwrap_or(false)
     }
 
     pub fn creator_stats(env: Env, creator: Address) -> CreatorStats {
         get_creator_stats(&env, &creator)
     }
 
-    // --- Functions for #46: Multi-Language Metadata ---
-    pub fn set_profile_cid(env: Env, creator: Address, cid: String) {
-        creator.require_auth();
-        let key = DataKey::CreatorProfileCID(creator.clone());
-        env.storage().persistent().set(&key, &cid);
-        // Bump TTL for the new entry and instance
-        bump_instance_ttl(&env);
-        env.storage().persistent().bump(&key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+    // --- Referral functionality ---
+
+    pub fn register_referral(env: Env, referrer: Address, referred_user: Address) {
+        referrer.require_auth();
+
+        // Check if referred user already has a referrer
+        let user_referrer_key = DataKey::UserReferrer(referred_user.clone());
+        if env.storage().persistent().has(&user_referrer_key) {
+            panic!("user already has a referrer");
+        }
+
+        // Check if referrer is trying to refer themselves
+        if referrer == referred_user {
+            panic!("cannot refer yourself");
+        }
+
+        // Set the referral relationship
+        env.storage()
+            .persistent()
+            .set(&user_referrer_key, &referrer);
+
+        // Update referrer's tracking info
+        let referral_tracker_key =
+            DataKey::ReferralTracker(referrer.clone(), referred_user.clone());
+        env.storage().persistent().set(&referral_tracker_key, &true);
+
+        // Get and update referrer's referral info
+        let mut referral_info = get_referral_info(&env, &referrer);
+        referral_info.referral_count += 1;
+        set_referral_info(&env, &referrer, &referral_info);
+
+        // Emit event
+        ReferralRegistered {
+            referrer,
+            referred_user,
+        }
+        .publish(&env);
     }
 
-    pub fn get_profile_cid(env: Env, creator: Address) -> Option<String> {
-        let key = DataKey::CreatorProfileCID(creator);
-        env.storage().persistent().get(&key)
+    pub fn get_user_referrer(env: Env, user: Address) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::UserReferrer(user))
+    }
+
+    pub fn get_referral_info(env: Env, referrer: Address) -> ReferralInfo {
+        get_referral_info(&env, &referrer)
     }
 }
 
@@ -374,8 +600,11 @@ fn subscription_exists(env: &Env, key: &DataKey) -> bool {
 }
 
 fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
-    if let Some(sub) = env.storage().persistent().get(key) { sub }
-    else { env.storage().temporary().get(key).expect("not found") }
+    if let Some(sub) = env.storage().persistent().get(key) {
+        sub
+    } else {
+        env.storage().temporary().get(key).expect("not found")
+    }
 }
 
 fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
@@ -437,13 +666,17 @@ fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address)
     }
 
     relationship.active_streams = relationship.active_streams.saturating_add(1);
-    env.storage().persistent().set(&relationship_key, &relationship);
+    env.storage()
+        .persistent()
+        .set(&relationship_key, &relationship);
     set_creator_stats(env, creator, &stats);
 }
 
 fn unregister_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
     let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
-    let Some(mut relationship): Option<CreatorAudience> = env.storage().persistent().get(&relationship_key) else {
+    let Some(mut relationship): Option<CreatorAudience> =
+        env.storage().persistent().get(&relationship_key)
+    else {
         return;
     };
 
@@ -458,7 +691,9 @@ fn unregister_creator_support(env: &Env, creator: &Address, beneficiary: &Addres
         stats.active_fans = stats.active_fans.saturating_sub(1);
     }
 
-    env.storage().persistent().set(&relationship_key, &relationship);
+    env.storage()
+        .persistent()
+        .set(&relationship_key, &relationship);
     set_creator_stats(env, creator, &stats);
 }
 
@@ -472,30 +707,19 @@ fn credit_creator_earnings(env: &Env, creator: &Address, amount: i128) {
     set_creator_stats(env, creator, &stats);
 }
 
-fn distribute_and_collect(env: &Env, beneficiary: &Address, stream_id: &Address, total_streamed_creator: Option<&Address>) -> i128 {
-    bump_instance_ttl(env);
+fn distribute_and_collect(
+    env: &Env,
+    beneficiary: &Address,
+    stream_id: &Address,
+    total_streamed_creator: Option<&Address>,
+) -> i128 {
     let key = subscription_key(beneficiary, stream_id);
     let mut sub = get_subscription(env, &key);
     let now = env.ledger().timestamp();
 
-    // --- NFT Badge Logic (#44) ---
-    // Check for 12-month fan badge
-    let duration = now.saturating_sub(sub.start_time);
-    if duration > TWELVE_MONTHS {
-        let nft_key = DataKey::NFTAwarded(beneficiary.clone(), stream_id.clone());
-        if !env.storage().persistent().has(&nft_key) {
-            env.storage().persistent().set(&nft_key, &true);
-            // Bump TTL for the new entry
-            env.storage().persistent().bump(&nft_key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
-            FanNftAwarded {
-                beneficiary: beneficiary.clone(),
-                creator: stream_id.clone(),
-                awarded_at: now,
-            }.publish(env);
-        }
+    if now <= sub.last_collected {
+        return 0;
     }
-
-    if now <= sub.last_collected { return 0; }
 
     let trial_end = sub.start_time.saturating_add(sub.tier.trial_duration);
     if !sub.free_to_paid_emitted && sub.tier.rate_per_second > 0 && now > trial_end {
@@ -517,25 +741,37 @@ fn distribute_and_collect(env: &Env, beneficiary: &Address, stream_id: &Address,
         }
     }
 
-    let charge_start = if sub.last_collected > trial_end { sub.last_collected } else { trial_end };
-    if now <= charge_start { return 0; }
+    let charge_start = if sub.last_collected > trial_end {
+        sub.last_collected
+    } else {
+        trial_end
+    };
+    if now <= charge_start {
+        return 0;
+    }
 
-    let amount_to_collect = calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
-    
+    let amount_to_collect =
+        calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
+
     // Check if grace period is active or expired
     if sub.balance <= 0 && sub.last_funds_exhausted > 0 {
         let grace_period_end = sub.last_funds_exhausted.saturating_add(GRACE_PERIOD);
-        if now > grace_period_end { return 0; }
+        if now > grace_period_end {
+            return 0;
+        }
     }
 
     if amount_to_collect > sub.balance {
-        if sub.last_funds_exhausted == 0 { sub.last_funds_exhausted = now; }
+        if sub.last_funds_exhausted == 0 {
+            sub.last_funds_exhausted = now;
+        }
         // During grace period, we cap payout at available balance to prevent contract draining
     }
 
     let available_balance = sub.balance.max(0);
     let total_accrued = amount_to_collect.saturating_add(sub.accrued_remainder);
-    let amount_to_payout_nano = total_accrued.min(available_balance.saturating_add(sub.accrued_remainder));
+    let amount_to_payout_nano =
+        total_accrued.min(available_balance.saturating_add(sub.accrued_remainder));
     let amount_to_payout_tokens = amount_to_payout_nano / PRECISION_MULTIPLIER;
 
     if amount_to_payout_tokens > 0 {
@@ -543,10 +779,40 @@ fn distribute_and_collect(env: &Env, beneficiary: &Address, stream_id: &Address,
         let creators_len = sub.creators.len();
         let mut remaining = amount_to_payout_tokens;
 
+        // Check for referral rebate before distributing to creators
+        let referral_rebate = if let Some(referrer) = get_user_referrer(env, &sub.beneficiary) {
+            // Calculate 1% rebate on the total amount being paid out
+            (amount_to_payout_tokens * REFERRAL_REBATE_BPS) / 10000
+        } else {
+            0
+        };
+
         for i in 0..creators_len {
             let creator = sub.creators.get(i).unwrap();
             let share = sub.percentages.get(i).unwrap() as i128;
-            let payout = if i + 1 == creators_len { remaining } else { (amount_to_payout_tokens * share) / 100 };
+            let mut payout = if i + 1 == creators_len {
+                remaining
+            } else {
+                (amount_to_payout_tokens * share) / 100
+            };
+
+            // Apply referral rebate if applicable and this is the first creator
+            if referral_rebate > 0 && i == 0 {
+                if payout > referral_rebate {
+                    payout -= referral_rebate;
+                    pay_referral_rebate(
+                        env,
+                        &sub.beneficiary,
+                        &creator,
+                        &sub.token,
+                        referral_rebate,
+                    );
+                } else {
+                    // If payout is too small for rebate, skip rebate
+                    remaining += referral_rebate; // Add back to remaining for other creators
+                }
+            }
+
             remaining -= payout;
             if payout > 0 {
                 credit_creator_earnings(env, &creator, payout);
@@ -570,9 +836,11 @@ fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount
 
     let token_client = TokenClient::new(env, &sub.token);
     token_client.transfer(&sub.payer, &env.current_contract_address(), &amount);
-    
+
     sub.balance += amount * PRECISION_MULTIPLIER;
-    if sub.balance > 0 { sub.last_funds_exhausted = 0; }
+    if sub.balance > 0 {
+        sub.last_funds_exhausted = 0;
+    }
     set_subscription(env, &key, &sub);
     distribute_and_collect(env, beneficiary, stream_id, None);
 }
@@ -583,7 +851,9 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
 
-    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("cannot cancel: minimum duration not met"); }
+    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION {
+        panic!("too early");
+    }
 
     distribute_and_collect(env, beneficiary, stream_id, None);
     sub = get_subscription(env, &key); // Refresh after collect
@@ -603,11 +873,22 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     env.storage().temporary().remove(&key);
 }
 
-fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: &Address, token: &Address, amount: i128, rate: i128, creators: soroban_sdk::Vec<Address>, percentages: soroban_sdk::Vec<u32>) {
-    bump_instance_ttl(env);
+fn subscribe_core(
+    env: &Env,
+    payer: &Address,
+    beneficiary: &Address,
+    stream_id: &Address,
+    token: &Address,
+    amount: i128,
+    rate: i128,
+    creators: soroban_sdk::Vec<Address>,
+    percentages: soroban_sdk::Vec<u32>,
+) {
     payer.require_auth();
     let key = subscription_key(beneficiary, stream_id);
-    if subscription_exists(env, &key) { panic!("exists"); }
+    if subscription_exists(env, &key) {
+        panic!("exists");
+    }
 
     let token_client = TokenClient::new(env, token);
     token_client.transfer(payer, &env.current_contract_address(), &amount);
@@ -616,7 +897,10 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
     let creators_for_stats = creators.clone();
     let sub = Subscription {
         token: token.clone(),
-        tier: Tier { rate_per_second: rate, trial_duration: FREE_TRIAL_DURATION },
+        tier: Tier {
+            rate_per_second: rate,
+            trial_duration: FREE_TRIAL_DURATION,
+        },
         balance: amount * PRECISION_MULTIPLIER,
         last_collected: now,
         start_time: now,
@@ -633,18 +917,82 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
         let creator = creators_for_stats.get(i).unwrap();
         register_creator_support(env, &creator, beneficiary);
     }
-    Subscribed { subscriber: beneficiary.clone(), creator: stream_id.clone(), rate_per_second: rate }.publish(env);
+    Subscribed {
+        subscriber: beneficiary.clone(),
+        creator: stream_id.clone(),
+        rate_per_second: rate,
+    }
+    .publish(env);
 }
 
 fn is_creator_paused(env: &Env, creator: &Address) -> bool {
-    env.storage().persistent().get(&DataKey::ChannelPaused(creator.clone())).unwrap_or(false)
+    env.storage()
+        .persistent()
+        .get(&DataKey::ChannelPaused(creator.clone()))
+        .unwrap_or(false)
+}
+
+// --- Referral Helper Functions ---
+
+fn get_referral_info(env: &Env, referrer: &Address) -> ReferralInfo {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ReferralTracker(
+            referrer.clone(),
+            referrer.clone(),
+        ))
+        .unwrap_or(ReferralInfo {
+            referrer: referrer.clone(),
+            referral_count: 0,
+            total_rebates_earned: 0,
+        })
+}
+
+fn set_referral_info(env: &Env, referrer: &Address, info: &ReferralInfo) {
+    env.storage().persistent().set(
+        &DataKey::ReferralTracker(referrer.clone(), referrer.clone()),
+        info,
+    );
+}
+
+fn get_user_referrer(env: &Env, user: &Address) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserReferrer(user.clone()))
+}
+
+fn pay_referral_rebate(
+    env: &Env,
+    referred_user: &Address,
+    creator: &Address,
+    token: &Address,
+    rebate_amount: i128,
+) {
+    if let Some(referrer) = get_user_referrer(env, referred_user) {
+        let token_client = TokenClient::new(env, token);
+
+        // Transfer rebate to referrer
+        token_client.transfer(&env.current_contract_address(), &referrer, &rebate_amount);
+
+        // Update referrer's stats
+        let mut referral_info = get_referral_info(env, &referrer);
+        referral_info.total_rebates_earned += rebate_amount;
+        set_referral_info(env, &referrer, &referral_info);
+
+        // Emit event
+        ReferralRebatePaid {
+            referrer,
+            referred_user: referred_user.clone(),
+            creator: creator.clone(),
+            amount: rebate_amount,
+        }
+        .publish(env);
+    }
 }
 
 #[cfg(test)]
 mod test;
 #[cfg(test)]
-mod test_withdrawal_consistency;
-#[cfg(test)]
 mod test_tiny_streams;
 #[cfg(test)]
-mod test_multi_tier_upgrade;
+mod test_withdrawal_consistency;
