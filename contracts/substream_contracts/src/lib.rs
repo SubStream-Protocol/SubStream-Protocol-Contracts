@@ -1,8 +1,10 @@
 #![no_std]
 #[cfg(test)]
 extern crate std;
-use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contractevent, contractimpl, contracttype, token::Client as TokenClient, vec, Address,
+    Env, String, Vec,
+};
 
 // --- Constants ---
 const MINIMUM_FLOW_DURATION: u64 = 86400;
@@ -11,6 +13,7 @@ const GRACE_PERIOD: u64 = 24 * 60 * 60;
 const GENESIS_NFT_ADDRESS: &str = "CAS3J7GYCCX7RRBHAHXDUY3OOWFMTIDDNVGCH6YOY7W7Y7G656H2HHMA";
 const DISCOUNT_BPS: i128 = 2000;
 const SIX_MONTHS: u64 = 180 * 24 * 60 * 60;
+const TWELVE_MONTHS: u64 = 365 * 24 * 60 * 60;
 const PRECISION_MULTIPLIER: i128 = 1_000_000_000;
 const REFERRAL_REBATE_BPS: i128 = 100; // 1% rebate
 
@@ -68,6 +71,8 @@ pub enum DataKey {
     CreatorSplit(Address),
     ContractAdmin,
     VerifiedCreator(Address),
+    CreatorProfileCID(Address),       // For #46
+    NFTAwarded(Address, Address), // (beneficiary, stream_id) - For #44
     BlacklistedUser(Address, Address), // (creator, user_to_block)
     CreatorAudience(Address, Address), // (creator, beneficiary)
     ReferralTracker(Address, Address), // (referrer, referred_user)
@@ -90,11 +95,13 @@ pub struct Subscription {
     pub last_collected: u64,
     pub start_time: u64,
     pub last_funds_exhausted: u64,
+    pub free_to_paid_emitted: bool,
     pub creators: soroban_sdk::Vec<Address>,
     pub percentages: soroban_sdk::Vec<u32>,
     pub payer: Address,
     pub beneficiary: Address,
     pub accrued_remainder: i128, // Dust/fractional units that haven't been paid as tokens
+    pub free_to_paid_emitted: bool,
 }
 
 #[contracttype]
@@ -136,6 +143,18 @@ pub struct TierChanged {
     pub creator: Address,
     pub old_rate: i128,
     pub new_rate: i128,
+}
+
+#[contractevent]
+pub struct UserBlacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
+}
+
+#[contractevent]
+pub struct UserUnblacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
 }
 
 #[contractevent]
@@ -202,6 +221,27 @@ pub struct ReferralRebatePaid {
     pub creator: Address,
     pub amount: i128,
 }
+
+#[contractevent]
+pub struct FanNftAwarded {
+    #[topic] pub beneficiary: Address,
+    #[topic] pub creator: Address, // stream_id
+    pub awarded_at: u64,
+}
+
+#[contractevent]
+pub struct UserBlacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
+}
+
+#[contractevent]
+pub struct UserUnblacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
+}
+
+
 
 #[contract]
 pub struct SubStreamContract;
@@ -547,6 +587,10 @@ impl SubStreamContract {
 
 // --- Internal Logic & Helpers ---
 
+fn bump_instance_ttl(env: &Env) {
+    env.storage().instance().bump(TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+}
+
 fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
     DataKey::Subscription(subscriber.clone(), stream_id.clone())
 }
@@ -567,9 +611,15 @@ fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
     if sub.balance > 0 {
         env.storage().persistent().set(key, sub);
         env.storage().temporary().remove(key);
+        // Bump TTL for active subscriptions to keep them from expiring
+        bump_instance_ttl(env);
+        env.storage().persistent().bump(key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
     } else {
         env.storage().temporary().set(key, sub);
         env.storage().persistent().remove(key);
+        // Only bump instance TTL if we are moving to temporary storage,
+        // as the temporary entry will expire on its own.
+        bump_instance_ttl(env);
     }
 }
 
@@ -779,6 +829,7 @@ fn distribute_and_collect(
 }
 
 fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount: i128) {
+    bump_instance_ttl(env);
     let key = subscription_key(beneficiary, stream_id);
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
@@ -795,6 +846,7 @@ fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount
 }
 
 fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
+    bump_instance_ttl(env);
     let key = subscription_key(beneficiary, stream_id);
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
