@@ -2,7 +2,7 @@
 #[cfg(test)]
 extern crate std;
 use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Vec};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
 
 // --- Constants ---
 const MINIMUM_FLOW_DURATION: u64 = 86400;
@@ -74,6 +74,7 @@ pub struct Subscription {
     pub last_collected: u64,
     pub start_time: u64,
     pub last_funds_exhausted: u64,
+    pub free_to_paid_emitted: bool,
     pub creators: soroban_sdk::Vec<Address>,
     pub percentages: soroban_sdk::Vec<u32>,
     pub payer: Address,
@@ -146,6 +147,19 @@ pub struct CreatorVerified {
     #[topic] pub creator: Address,
     #[topic] pub verified_by: Address,
 }
+
+#[contractevent]
+pub struct UserBlacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
+}
+
+#[contractevent]
+pub struct UserUnblacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
+}
+
 
 #[contract]
 pub struct SubStreamContract;
@@ -496,11 +510,64 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
 
-    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("too early"); }
+    let now = env.ledger().timestamp();
+    let is_early = now < sub.start_time + MINIMUM_FLOW_DURATION;
 
+    // Collect any charges that have accrued so far (zero during the trial window).
     distribute_and_collect(env, beneficiary, stream_id, None);
-    sub = get_subscription(env, &key); // Refresh after collect
+    sub = get_subscription(env, &key); // Refresh after collect.
 
+    if is_early {
+        // The creator is entitled to compensation equal to the full minimum-lock
+        // period even though the subscriber is cancelling early.  This prevents
+        // flash-subscribe attacks where a user subscribes, scrapes content, and
+        // immediately cancels to recover their deposit.
+        //
+        // Penalty = rate_per_second × MINIMUM_FLOW_DURATION (in internal nano
+        // units), capped at the remaining balance so we never overdraw.
+        let min_entitled_nano = sub.tier.rate_per_second
+            .saturating_mul(MINIMUM_FLOW_DURATION as i128);
+        let available_nano = sub.balance.max(0);
+        let penalty_nano = min_entitled_nano.min(available_nano);
+        let penalty_tokens = penalty_nano / PRECISION_MULTIPLIER;
+
+        if penalty_tokens > 0 {
+            let token_client = TokenClient::new(env, &sub.token);
+            let creators_len = sub.creators.len();
+            let mut remaining_penalty = penalty_tokens;
+
+            for i in 0..creators_len {
+                let creator = sub.creators.get(i).unwrap();
+                let share = sub.percentages.get(i).unwrap() as i128;
+                let payout = if i + 1 == creators_len {
+                    remaining_penalty
+                } else {
+                    (penalty_tokens * share) / 100
+                };
+                remaining_penalty -= payout;
+                if payout > 0 {
+                    credit_creator_earnings(env, &creator, payout);
+                    token_client.transfer(&env.current_contract_address(), &creator, &payout);
+                }
+            }
+        }
+
+        // Deduct penalty from balance so the refund block below uses the
+        // correct remaining amount.
+        sub.balance = sub.balance.saturating_sub(penalty_nano);
+
+        let refund_amount = sub.balance.max(0) / PRECISION_MULTIPLIER;
+        env.events().publish(
+            (
+                Symbol::new(env, "early_cancel"),
+                beneficiary.clone(),
+                stream_id.clone(),
+            ),
+            (penalty_tokens, refund_amount),
+        );
+    }
+
+    // Refund any remaining balance to the payer.
     if sub.balance > 0 {
         let token_client = TokenClient::new(env, &sub.token);
         let refund_amount = sub.balance / PRECISION_MULTIPLIER;
@@ -508,6 +575,7 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
             token_client.transfer(&env.current_contract_address(), &sub.payer, &refund_amount);
         }
     }
+
     for i in 0..sub.creators.len() {
         let creator = sub.creators.get(i).unwrap();
         unregister_creator_support(env, &creator, beneficiary);
