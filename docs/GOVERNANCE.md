@@ -386,6 +386,87 @@ Changes to the governance process itself.
 
 ---
 
+## Creator Profile Metadata Standard
+
+To ensure interoperability between different frontends and applications building on the SubStream Protocol, we propose a standardized JSON schema for creator profiles. This metadata should be stored off-chain (e.g., on IPFS), and the Content Identifier (CID) should be linked to the creator's on-chain profile using the `set_profile_cid` function.
+
+This standard is proposed under the **Informational Track** and helps fulfill the requirements of Issue #46 (Multi-Language Metadata) and #50 (Standardizing Creator CIDs).
+
+### Schema Definition (Version 1.0)
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SubStream Creator Profile",
+  "description": "Standard metadata for a SubStream creator profile.",
+  "type": "object",
+  "properties": {
+    "name": {
+      "description": "The display name of the creator.",
+      "type": "string"
+    },
+    "bio": {
+      "description": "A short biography of the creator.",
+      "type": "string"
+    },
+    "image": {
+      "description": "A URL (preferably IPFS) to the creator's profile picture.",
+      "type": "string",
+      "format": "uri"
+    },
+    "socials": {
+      "description": "Links to social media profiles.",
+      "type": "object",
+      "properties": {
+        "twitter": { "type": "string" },
+        "youtube": { "type": "string" },
+        "website": { "type": "string", "format": "uri" }
+      }
+    },
+    "i18n": {
+      "description": "Internationalization object for localized text, using language codes.",
+      "type": "object",
+      "patternProperties": {
+        "^[a-z]{2}(-[A-Z]{2})?$": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "bio": { "type": "string" }
+          }
+        }
+      }
+    }
+  },
+  "required": ["name"]
+}
+```
+
+### Example
+
+```json
+{
+  "name": "Cooking with Sarah",
+  "bio": "Exploring the world's cuisines, one dish at a time. Join my stream for exclusive recipes and live cooking sessions!",
+  "image": "ipfs://bafybeigv4vj3gblj6f27bm2i467p722m35ub22qalyk2sfyvj2f2j2j2j2",
+  "socials": {
+    "twitter": "CookWithSarah",
+    "youtube": "CookingWithSarahChannel"
+  },
+  "i18n": {
+    "es": {
+      "name": "Cocinando con Sarah",
+      "bio": "Explorando las cocinas del mundo, un plato a la vez. ¡Únete a mi stream para recetas exclusivas y sesiones de cocina en vivo!"
+    },
+    "fr": {
+      "name": "Cuisiner avec Sarah",
+      "bio": "Explorer les cuisines du monde, un plat à la fois. Rejoignez mon stream pour des recettes exclusives et des sessions de cuisine en direct !"
+    }
+  }
+}
+```
+
+---
+
 ## Proposal Lifecycle States
 
 ```

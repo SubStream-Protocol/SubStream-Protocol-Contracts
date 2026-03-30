@@ -1071,3 +1071,75 @@ fn test_creator_stats_scale_with_cached_counters() {
     assert_eq!(stats.active_fans, FAN_COUNT);
     assert_eq!(stats.total_earned, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Profile Metadata CID — Issue #46
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_set_and_get_profile_cid() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    // Initially none
+    assert!(client.get_profile_cid(&creator).is_none());
+
+    // Set CID
+    let cid = soroban_sdk::String::from_str(&env, "ipfs://bafkreigh2akiscaildcqabsyg3dfr6cjhzm73eeeobcnukw45653cwobum");
+    client.set_profile_cid(&creator, &cid);
+
+    // Retrieve CID
+    let retrieved_cid = client.get_profile_cid(&creator).unwrap();
+    assert_eq!(retrieved_cid, cid);
+}
+
+// ---------------------------------------------------------------------------
+// 12-Month NFT Badge Logic — Issue #44
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_12_month_nft_badge_event_emission() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    
+    // Mint a large amount so the balance doesn't deplete over 12 months
+    token_admin.mint(&subscriber, &100_000_000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    let start_time = 100u64;
+    env.ledger().set_timestamp(start_time);
+    
+    // Subscribe with a low rate so funds last
+    client.subscribe(&subscriber, &creator, &token.address, &100_000, &1);
+
+    // Fast forward to exactly 12 months (TWELVE_MONTHS = 365 * 24 * 60 * 60 = 31536000)
+    // We need to go strictly OVER 12 months as per the condition `duration > TWELVE_MONTHS`
+    let twelve_months_and_a_day = 31536000 + 86400;
+    env.ledger().set_timestamp(start_time + twelve_months_and_a_day);
+    
+    // Record event count before collect
+    let events_before = last_call_contract_event_count(&env, &contract_id);
+    
+    // Collect will trigger the 12-month check
+    client.collect(&subscriber, &creator);
+    
+    // Assert that new events were emitted during this collect call (which corresponds to FanNftAwarded).
+    let events_after = last_call_contract_event_count(&env, &contract_id);
+    assert!(
+        events_after > events_before, 
+        "Expected FanNftAwarded event to be emitted after 12 months of support"
+    );
+}
