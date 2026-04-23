@@ -25,9 +25,14 @@ const UPTIME_ORACLE_NONCE_TTL: u64 = 24 * 60 * 60; // 24 hour validity for oracl
 // --- Merchant Registry and KYC Whitelisting Constants ---
 const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
 const MERCHANT_KYC_VALIDITY: u64 = 365 * 24 * 60 * 60; // 1 year validity for KYC credentials
-const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
+const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
 const TIMELOCK_DURATION: u64 = 48 * 60 * 60; // 48-hour timelock for registry updates
 const SECURITY_COUNCIL_SIZE: u32 = 5; // 5-member security council for multi-sig
+
+// --- Dynamic Protocol Fee Constants ---
+const PROTOCOL_FEE_MAX_BPS: u32 = 500; // Maximum 5% protocol fee (500 basis points)
+const PROTOCOL_FEE_TIMELOCK_DURATION: u64 = 7 * 24 * 60 * 60; // 7-day timelock for fee increases
+const DEFAULT_PROTOCOL_FEE_BPS: u32 = 200; // Default 2% protocol fee (200 basis points)
 
 // --- Helper: Charge Calculation ---
 fn calculate_discounted_charge(
@@ -105,6 +110,9 @@ pub enum DataKey {
     RegistryUpdateProposal(u64),     // Timelock proposal for registry updates
     SecurityCouncilMember(Address),   // Security council membership
     SecurityCouncilVeto(Address, u64), // Security council veto on proposal
+    // --- Dynamic Protocol Fee Keys ---
+    ProtocolFeeConfig,               // Global protocol fee configuration
+    ProtocolFeeUpdateProposal(u64),   // Protocol fee update proposal with timelock
     // --- Global Reentrancy Guard Keys ---
     ReentrancyGuard,                 // Global reentrancy protection state
 }
@@ -315,6 +323,31 @@ pub struct SecurityCouncilVeto {
     pub proposal_id: u64,
     pub veto_reason: soroban_sdk::String,
     pub vetoed_at: u64,
+}
+
+// --- Dynamic Protocol Fee Data Structures ---
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolFeeConfig {
+    pub current_fee_bps: u32,        // Current protocol fee in basis points
+    pub last_updated: u64,            // Timestamp of last fee update
+    pub updated_by: Address,         // Who updated the fee
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolFeeUpdateProposal {
+    pub proposal_id: u64,
+    pub new_fee_bps: u32,             // Proposed new fee in basis points
+    pub old_fee_bps: u32,             // Current fee at time of proposal
+    pub proposed_by: Address,         // Who proposed the change
+    pub proposed_at: u64,             // When the proposal was created
+    pub executable_at: u64,           // When the proposal can be executed (7 days later for increases)
+    pub votes_for: soroban_sdk::Vec<Address>,  // DAO members voting for
+    pub executed: bool,               // Whether the proposal has been executed
+    pub canceled: bool,               // Whether the proposal was canceled
+    pub is_fee_increase: bool,       // True if new fee > old fee (triggers timelock)
 }
 
 #[contracttype]
@@ -579,6 +612,26 @@ pub struct ReplayAttackBlocked {
     pub blocked_at: u64,
 }
 
+#[contractevent]
+pub struct ProtocolFeeUpdateScheduled {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub proposed_by: Address,
+    pub old_fee_bps: u32,
+    pub new_fee_bps: u32,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+    pub is_fee_increase: bool,
+}
+
+#[contractevent]
+pub struct ProtocolFeeUpdateExecuted {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub executed_by: Address,
+    pub old_fee_bps: u32,
+    pub new_fee_bps: u32,
+    pub executed_at: u64,
+}
+
 #[contract]
 pub struct SubStreamContract;
 
@@ -591,6 +644,17 @@ impl SubStreamContract {
         env.storage()
             .persistent()
             .set(&DataKey::ContractAdmin, &admin);
+        
+        // Initialize protocol fee configuration with default fee
+        let now = env.ledger().timestamp();
+        let fee_config = ProtocolFeeConfig {
+            current_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+            last_updated: now,
+            updated_by: admin.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProtocolFeeConfig, &fee_config);
     }
 
     pub fn verify_creator(env: Env, admin: Address, creator: Address) {
@@ -1551,6 +1615,188 @@ impl SubStreamContract {
             .expect("merchant not found")
     }
 
+    // --- Dynamic Protocol Fee Management ---
+
+    /// Get current protocol fee configuration
+    pub fn get_protocol_fee_config(env: Env) -> ProtocolFeeConfig {
+        env.storage().persistent()
+            .get(&DataKey::ProtocolFeeConfig)
+            .expect("protocol fee config not initialized")
+    }
+
+    /// Propose a protocol fee update (DAO multi-sig only)
+    pub fn propose_protocol_fee_update(
+        env: Env,
+        dao_member: Address,
+        new_fee_bps: u32,
+    ) -> u64 {
+        dao_member.require_auth();
+        
+        // Verify DAO member authorization
+        if !is_authorized_dao_member(&env, &dao_member) {
+            panic!("unauthorized DAO member");
+        }
+
+        // Validate fee bounds
+        if new_fee_bps > PROTOCOL_FEE_MAX_BPS {
+            panic!("fee exceeds maximum allowed");
+        }
+
+        let current_config = get_protocol_fee_config(env.clone());
+        let now = env.ledger().timestamp();
+        
+        // Check if this is actually a change
+        if new_fee_bps == current_config.current_fee_bps {
+            panic!("no change in fee rate");
+        }
+
+        // Generate proposal ID
+        let proposal_id = now; // Using timestamp as unique ID
+        
+        // Determine if this is a fee increase (triggers timelock)
+        let is_fee_increase = new_fee_bps > current_config.current_fee_bps;
+        let executable_at = if is_fee_increase {
+            now + PROTOCOL_FEE_TIMELOCK_DURATION
+        } else {
+            now // Fee decreases can be executed immediately
+        };
+
+        let proposal = ProtocolFeeUpdateProposal {
+            proposal_id,
+            new_fee_bps,
+            old_fee_bps: current_config.current_fee_bps,
+            proposed_by: dao_member.clone(),
+            proposed_at: now,
+            executable_at,
+            votes_for: vec![&env],
+            executed: false,
+            canceled: false,
+            is_fee_increase,
+        };
+
+        env.storage().persistent()
+            .set(&DataKey::ProtocolFeeUpdateProposal(proposal_id), &proposal);
+
+        // Emit event
+        ProtocolFeeUpdateScheduled {
+            proposal_id,
+            proposed_by: dao_member,
+            old_fee_bps: current_config.current_fee_bps,
+            new_fee_bps,
+            proposed_at: now,
+            executable_at,
+            is_fee_increase,
+        }.publish(&env);
+
+        proposal_id
+    }
+
+    /// Vote on a protocol fee update proposal
+    pub fn vote_protocol_fee_update(
+        env: Env,
+        dao_member: Address,
+        proposal_id: u64,
+    ) {
+        dao_member.require_auth();
+        
+        // Verify DAO member authorization
+        if !is_authorized_dao_member(&env, &dao_member) {
+            panic!("unauthorized DAO member");
+        }
+
+        let proposal_key = DataKey::ProtocolFeeUpdateProposal(proposal_id);
+        let mut proposal: ProtocolFeeUpdateProposal = env.storage().persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+
+        // Check if proposal is still active
+        if proposal.executed || proposal.canceled {
+            panic!("proposal not active");
+        }
+
+        // Check if already voted
+        if proposal.votes_for.contains(&dao_member) {
+            panic!("already voted");
+        }
+
+        // Add vote
+        proposal.votes_for.push_back(dao_member.clone());
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        // Check if proposal has reached consensus and can be executed
+        if proposal.votes_for.len() >= DAO_MULTISIG_THRESHOLD as usize {
+            let now = env.ledger().timestamp();
+            
+            // Check timelock for fee increases
+            if now >= proposal.executable_at {
+                execute_protocol_fee_update(&env, proposal_id);
+            }
+        }
+    }
+
+    /// Execute a protocol fee update proposal (after timelock and consensus)
+    pub fn execute_protocol_fee_update(
+        env: Env,
+        dao_member: Address,
+        proposal_id: u64,
+    ) {
+        dao_member.require_auth();
+        
+        // Verify DAO member authorization
+        if !is_authorized_dao_member(&env, &dao_member) {
+            panic!("unauthorized DAO member");
+        }
+
+        execute_protocol_fee_update(&env, proposal_id);
+    }
+
+    // --- Helper Functions for Protocol Fee Management ---
+
+    fn execute_protocol_fee_update(env: &Env, proposal_id: u64) {
+        let proposal_key = DataKey::ProtocolFeeUpdateProposal(proposal_id);
+        let mut proposal: ProtocolFeeUpdateProposal = env.storage().persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+
+        let now = env.ledger().timestamp();
+        
+        // Check timelock for fee increases
+        if proposal.is_fee_increase && now < proposal.executable_at {
+            panic!("timelock not expired");
+        }
+
+        // Check consensus
+        if proposal.votes_for.len() < DAO_MULTISIG_THRESHOLD as usize {
+            panic!("insufficient consensus");
+        }
+
+        // Update protocol fee configuration
+        let mut fee_config: ProtocolFeeConfig = env.storage().persistent()
+            .get(&DataKey::ProtocolFeeConfig)
+            .expect("protocol fee config not initialized");
+        
+        let old_fee_bps = fee_config.current_fee_bps;
+        fee_config.current_fee_bps = proposal.new_fee_bps;
+        fee_config.last_updated = now;
+        fee_config.updated_by = proposal.proposed_by.clone();
+
+        // Mark proposal as executed
+        proposal.executed = true;
+
+        // Save changes
+        env.storage().persistent().set(&DataKey::ProtocolFeeConfig, &fee_config);
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        // Emit event
+        ProtocolFeeUpdateExecuted {
+            proposal_id,
+            executed_by: proposal.proposed_by.clone(),
+            old_fee_bps,
+            new_fee_bps: proposal.new_fee_bps,
+            executed_at: now,
+        }.publish(env);
+    }
+
     // --- Anonymous Subscription Verification with Nullifier Tracking ---
     
     // Constants for nullifier management
@@ -1888,10 +2134,31 @@ fn distribute_and_collect(
         let creators_len = sub.creators.len();
         let mut remaining = amount_to_payout_tokens;
 
+        // Get current protocol fee configuration
+        let fee_config: ProtocolFeeConfig = env.storage().persistent()
+            .get(&DataKey::ProtocolFeeConfig)
+            .unwrap_or(ProtocolFeeConfig {
+                current_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                last_updated: 0,
+                updated_by: env.current_contract_address(),
+            });
+
+        // Calculate protocol fee
+        let protocol_fee = (amount_to_payout_tokens * fee_config.current_fee_bps as i128) / 10000;
+        let amount_for_creators = amount_to_payout_tokens - protocol_fee;
+
+        // Send protocol fee to treasury (contract admin acts as treasury)
+        if protocol_fee > 0 {
+            let treasury: Address = env.storage().persistent()
+                .get(&DataKey::ContractAdmin)
+                .expect("contract admin not found");
+            token_client.transfer(&env.current_contract_address(), &treasury, &protocol_fee);
+        }
+
         // Check for referral rebate before distributing to creators
         let referral_rebate = if let Some(referrer) = get_user_referrer(env, &sub.beneficiary) {
-            // Calculate 1% rebate on the total amount being paid out
-            (amount_to_payout_tokens * REFERRAL_REBATE_BPS) / 10000
+            // Calculate 1% rebate on the amount going to creators (not including protocol fee)
+            (amount_for_creators * REFERRAL_REBATE_BPS) / 10000
         } else {
             0
         };
@@ -1900,9 +2167,9 @@ fn distribute_and_collect(
             let creator = sub.creators.get(i).unwrap();
             let share = sub.percentages.get(i).unwrap() as i128;
             let mut payout = if i + 1 == creators_len {
-                remaining
+                remaining - protocol_fee - referral_rebate
             } else {
-                (amount_to_payout_tokens * share) / 100
+                (amount_for_creators * share) / 100
             };
 
             // Apply referral rebate if applicable and this is the first creator
@@ -2436,10 +2703,31 @@ fn distribute_and_collect(
         let creators_len = sub.creators.len();
         let mut remaining = amount_to_payout_tokens;
 
+        // Get current protocol fee configuration
+        let fee_config: ProtocolFeeConfig = env.storage().persistent()
+            .get(&DataKey::ProtocolFeeConfig)
+            .unwrap_or(ProtocolFeeConfig {
+                current_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                last_updated: 0,
+                updated_by: env.current_contract_address(),
+            });
+
+        // Calculate protocol fee
+        let protocol_fee = (amount_to_payout_tokens * fee_config.current_fee_bps as i128) / 10000;
+        let amount_for_creators = amount_to_payout_tokens - protocol_fee;
+
+        // Send protocol fee to treasury (contract admin acts as treasury)
+        if protocol_fee > 0 {
+            let treasury: Address = env.storage().persistent()
+                .get(&DataKey::ContractAdmin)
+                .expect("contract admin not found");
+            token_client.transfer(&env.current_contract_address(), &treasury, &protocol_fee);
+        }
+
         // Check for referral rebate before distributing to creators
         let referral_rebate = if let Some(referrer) = get_user_referrer(env, &sub.beneficiary) {
-            // Calculate 1% rebate on the total amount being paid out
-            (amount_to_payout_tokens * REFERRAL_REBATE_BPS) / 10000
+            // Calculate 1% rebate on the amount going to creators (not including protocol fee)
+            (amount_for_creators * REFERRAL_REBATE_BPS) / 10000
         } else {
             0
         };
@@ -2448,9 +2736,9 @@ fn distribute_and_collect(
             let creator = sub.creators.get(i).unwrap();
             let share = sub.percentages.get(i).unwrap() as i128;
             let mut payout = if i + 1 == creators_len {
-                remaining
+                remaining - protocol_fee - referral_rebate
             } else {
-                (amount_to_payout_tokens * share) / 100
+                (amount_for_creators * share) / 100
             };
 
             // Apply referral rebate if applicable and this is the first creator
