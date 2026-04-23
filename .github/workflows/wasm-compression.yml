@@ -1,0 +1,32 @@
+name: WASM Build & Compress
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build_and_compress:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: contracts/substream_contracts
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-opt
+        run: npm install -g wasm-opt
+
+      - name: Make script executable
+        run: chmod +x scripts/compress_wasm.sh
+
+      - name: Build and Compress WASM
+        run: make build-compressed

@@ -69,7 +69,7 @@
                   "i128": "100"
                 },
                 {
-                  "i128": "1"
+                  "i128": "1000000000"
                 }
               ]
             }
@@ -121,7 +121,6 @@
         }
       ]
     ],
-    [],
     [],
     []
   ],
@@ -246,49 +245,36 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "CreatorSubscribers"
+                    "symbol": "CreatorAudience"
                   },
                   {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "vec": []
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 4095
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
-              "key": "ledger_key_contract_instance",
-              "durability": "persistent",
-              "val": {
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "TotalStreamed"
                   },
                   {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                  },
-                  {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "i128": "100"
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "active_streams"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "has_supported"
+                    },
+                    "val": {
+                      "bool": true
+                    }
+                  }
+                ]
               }
             }
           },
@@ -303,10 +289,44 @@
             "contract_data": {
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
-              "key": "ledger_key_contract_instance",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "CreatorMetadata"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                  }
+                ]
+              },
               "durability": "persistent",
               "val": {
-                "vec": []
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "active_fans"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lifetime_fans"
+                    },
+                    "val": {
+                      "u64": "1"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "total_earned"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  }
+                ]
               }
             }
           },

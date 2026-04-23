@@ -69,7 +69,7 @@
                   "i128": "100"
                 },
                 {
-                  "i128": "1"
+                  "i128": "1000000000"
                 }
               ]
             }
@@ -202,18 +202,34 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "CreatorSubscribers"
+                    "symbol": "CreatorAudience"
                   },
                   {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "vec": [
+                "map": [
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                    "key": {
+                      "symbol": "active_streams"
+                    },
+                    "val": {
+                      "u32": 1
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "has_supported"
+                    },
+                    "val": {
+                      "bool": true
+                    }
                   }
                 ]
               }
@@ -233,7 +249,59 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "Stream"
+                    "symbol": "CreatorMetadata"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "active_fans"
+                    },
+                    "val": {
+                      "u64": "1"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lifetime_fans"
+                    },
+                    "val": {
+                      "u64": "1"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "total_earned"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "Subscription"
                   },
                   {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -248,10 +316,26 @@
                 "map": [
                   {
                     "key": {
+                      "symbol": "accrued_remainder"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "balance"
                     },
                     "val": {
-                      "i128": "100"
+                      "i128": "100000000000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "beneficiary"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                     }
                   },
                   {
@@ -268,6 +352,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "free_to_paid_emitted"
+                    },
+                    "val": {
+                      "bool": false
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "last_collected"
                     },
                     "val": {
@@ -276,19 +368,23 @@
                   },
                   {
                     "key": {
-                      "symbol": "percentages"
+                      "symbol": "last_funds_exhausted"
                     },
                     "val": {
-                      "vec": [
-                        {
-                          "u32": 100
-                        }
-                      ]
+                      "u64": "0"
                     }
                   },
                   {
                     "key": {
-                      "symbol": "rate_per_second"
+                      "symbol": "payer"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "percentages"
                     },
                     "val": {
                       "vec": [
@@ -317,7 +413,7 @@
                             "symbol": "rate_per_second"
                           },
                           "val": {
-                            "i128": "1"
+                            "i128": "1000000000"
                           }
                         },
                         {

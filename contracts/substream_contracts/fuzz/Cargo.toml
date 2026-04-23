@@ -1,0 +1,24 @@
+[package]
+name = "substream_contracts-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+soroban-sdk = { version = "25", features = ["testutils"] }
+
+[dependencies.substream_contracts]
+path = ".."
+
+[[bin]]
+name = "withdrawal_consistency"
+path = "fuzz_targets/withdrawal_consistency.rs"
+test = false
+doc = false
+bench = false
