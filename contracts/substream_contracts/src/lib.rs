@@ -2,15 +2,18 @@
 #[cfg(test)]
 extern crate std;
 use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env};
 
 // --- Constants ---
 const MINIMUM_FLOW_DURATION: u64 = 86400;
 const FREE_TRIAL_DURATION: u64 = 7 * 24 * 60 * 60;
 const GRACE_PERIOD: u64 = 24 * 60 * 60;
+#[allow(dead_code)]
 const GENESIS_NFT_ADDRESS: &str = "CAS3J7GYCCX7RRBHAHXDUY3OOWFMTIDDNVGCH6YOY7W7Y7G656H2HHMA";
+#[allow(dead_code)]
 const DISCOUNT_BPS: i128 = 2000;
 const SIX_MONTHS: u64 = 180 * 24 * 60 * 60;
+#[allow(dead_code)]
 const TWELVE_MONTHS: u64 = 365 * 24 * 60 * 60;
 const PRECISION_MULTIPLIER: i128 = 1_000_000_000;
 const REFERRAL_REBATE_BPS: i128 = 100; // 1% rebate
@@ -284,8 +287,10 @@ pub struct TierChanged {
 
 #[contractevent]
 pub struct AcceptedTokenSet {
-    #[topic] pub creator: Address,
-    #[topic] pub token: Address,
+    #[topic]
+    pub creator: Address,
+    #[topic]
+    pub token: Address,
 }
 
 #[contractevent]
@@ -355,21 +360,27 @@ pub struct ReferralRebatePaid {
 
 #[contractevent]
 pub struct FanNftAwarded {
-    #[topic] pub beneficiary: Address,
-    #[topic] pub creator: Address, // stream_id
+    #[topic]
+    pub beneficiary: Address,
+    #[topic]
+    pub creator: Address, // stream_id
     pub awarded_at: u64,
 }
 
 #[contractevent]
 pub struct UserBlacklisted {
-    #[topic] pub creator: Address,
-    #[topic] pub user: Address,
+    #[topic]
+    pub creator: Address,
+    #[topic]
+    pub user: Address,
 }
 
 #[contractevent]
 pub struct UserUnblacklisted {
-    #[topic] pub creator: Address,
-    #[topic] pub user: Address,
+    #[topic]
+    pub creator: Address,
+    #[topic]
+    pub user: Address,
 }
 
 #[contractevent]
@@ -485,6 +496,7 @@ pub struct ReentrancyAttemptDetected {
 #[contract]
 pub struct SubStreamContract;
 
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl SubStreamContract {
     pub fn initialize(env: Env, admin: Address) {
@@ -545,6 +557,7 @@ impl SubStreamContract {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe_gift(
         env: &Env,
         payer: Address,
@@ -682,6 +695,7 @@ impl SubStreamContract {
         .publish(&env);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe_group(
         env: Env,
         payer: Address,
@@ -783,7 +797,9 @@ impl SubStreamContract {
 
     pub fn set_minimum_rate(env: Env, creator: Address, min_rate: i128) {
         creator.require_auth();
-        env.storage().persistent().set(&DataKey::MinimumRate(creator), &min_rate);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinimumRate(creator), &min_rate);
     }
 
     pub fn set_community_goal(env: Env, creator: Address, goal_tokens_per_day: i128) {
@@ -791,21 +807,35 @@ impl SubStreamContract {
         // Convert tokens/day to flow rate (units per second)
         // Using PRECISION_MULTIPLIER to maintain high-fidelity streaming math
         let goal_per_sec = (goal_tokens_per_day * PRECISION_MULTIPLIER) / 86400;
-        env.storage().persistent().set(&DataKey::CommunityGoal(creator), &goal_per_sec);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommunityGoal(creator), &goal_per_sec);
     }
 
     pub fn is_community_goal_met(env: Env, creator: Address) -> bool {
-        let goal: i128 = env.storage().persistent().get(&DataKey::CommunityGoal(creator.clone())).unwrap_or(0);
-        if goal == 0 { return false; }
+        let goal: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommunityGoal(creator.clone()))
+            .unwrap_or(0);
+        if goal == 0 {
+            return false;
+        }
 
-        let current: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(creator)).unwrap_or(0);
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentFlowRate(creator))
+            .unwrap_or(0);
         current >= goal
     }
 
     // --- Issue #49: Stablecoin-Only Enforcement ---
     pub fn set_accepted_token(env: Env, creator: Address, token: Address) {
         creator.require_auth();
-        env.storage().persistent().set(&DataKey::AcceptedToken(creator.clone()), &token);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AcceptedToken(creator.clone()), &token);
         AcceptedTokenSet { creator, token }.publish(&env);
     }
 
@@ -1247,7 +1277,9 @@ fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
         env.storage().temporary().remove(key);
         // Bump TTL for active subscriptions to keep them from expiring
         bump_instance_ttl(env);
-        env.storage().persistent().bump(key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+        env.storage()
+            .persistent()
+            .extend_ttl(key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
     } else {
         env.storage().temporary().set(key, sub);
         env.storage().persistent().remove(key);
@@ -1395,10 +1427,8 @@ fn distribute_and_collect(
         }
     }
 
-    if amount_to_collect > sub.balance {
-        if sub.last_funds_exhausted == 0 {
-            sub.last_funds_exhausted = now;
-        }
+    if amount_to_collect > sub.balance && sub.last_funds_exhausted == 0 {
+        sub.last_funds_exhausted = now;
         // During grace period, we cap payout at available balance to prevent contract draining
     }
 
@@ -1414,7 +1444,7 @@ fn distribute_and_collect(
         let mut remaining = amount_to_payout_tokens;
 
         // Check for referral rebate before distributing to creators
-        let referral_rebate = if let Some(referrer) = get_user_referrer(env, &sub.beneficiary) {
+        let referral_rebate = if let Some(_referrer) = get_user_referrer(env, &sub.beneficiary) {
             // Calculate 1% rebate on the total amount being paid out
             (amount_to_payout_tokens * REFERRAL_REBATE_BPS) / 10000
         } else {
@@ -1469,7 +1499,7 @@ fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount
     sub.payer.require_auth();
 
     let token_client = TokenClient::new(env, &sub.token);
-    token_client.transfer(&sub.payer, &env.current_contract_address(), &amount);
+    token_client.transfer(&sub.payer, env.current_contract_address(), &amount);
 
     sub.balance += amount * PRECISION_MULTIPLIER;
     if sub.balance > 0 {
@@ -1485,14 +1515,13 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
 
-    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("cannot cancel stream: minimum duration not met"); }
+    let now = env.ledger().timestamp();
+    let is_early = now < sub.start_time + MINIMUM_FLOW_DURATION;
 
     // Collect any charges that have accrued so far (zero during the trial window).
     distribute_and_collect(env, beneficiary, stream_id, None);
     sub = get_subscription(env, &key); // Refresh after collect.
 
-    // Calculate penalty for early cancellation (optional logic from your existing code, assuming is_early was pseudo-code)
-    let is_early = false; // Add logic here if needed to determine early cancellation based on start_time
     if is_early {
         // The creator is entitled to compensation equal to the full minimum-lock
         // period even though the subscriber is cancelling early.  This prevents
@@ -1501,7 +1530,9 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
         //
         // Penalty = rate_per_second × MINIMUM_FLOW_DURATION (in internal nano
         // units), capped at the remaining balance so we never overdraw.
-        let min_entitled_nano = sub.tier.rate_per_second
+        let min_entitled_nano = sub
+            .tier
+            .rate_per_second
             .saturating_mul(MINIMUM_FLOW_DURATION as i128);
         let available_nano = sub.balance.max(0);
         let penalty_nano = min_entitled_nano.min(available_nano);
@@ -1526,13 +1557,20 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
                     token_client.transfer(&env.current_contract_address(), &creator, &payout);
                 }
             }
+            sub.balance -= penalty_nano.min(available_nano);
         }
     }
 
     let rate = sub.tier.rate_per_second;
-    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
+    let mut total_flow: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CurrentFlowRate(stream_id.clone()))
+        .unwrap_or(0);
     total_flow = total_flow.saturating_sub(rate);
-    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
+    env.storage()
+        .persistent()
+        .set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
 
     if sub.balance > 0 {
         let token_client = TokenClient::new(&env, &sub.token);
@@ -1550,6 +1588,7 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     env.storage().temporary().remove(&key);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn subscribe_core(
     env: &Env,
     payer: &Address,
@@ -1564,7 +1603,11 @@ fn subscribe_core(
     payer.require_auth();
 
     // --- Issue #49: Stablecoin-Only Enforcement Mode ---
-    if let Some(accepted_token) = env.storage().persistent().get::<_, Address>(&DataKey::AcceptedToken(stream_id.clone())) {
+    if let Some(accepted_token) = env
+        .storage()
+        .persistent()
+        .get::<_, Address>(&DataKey::AcceptedToken(stream_id.clone()))
+    {
         if token != &accepted_token {
             panic!("creator only accepts their specified stablecoin");
         }
@@ -1576,13 +1619,19 @@ fn subscribe_core(
         panic!("exists");
     }
 
-    let floor: i128 = env.storage().persistent().get(&DataKey::MinimumRate(stream_id.clone())).unwrap_or(0);
-    if rate < floor { panic!("rate below floor"); }
+    let floor: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::MinimumRate(stream_id.clone()))
+        .unwrap_or(0);
+    if rate < floor {
+        panic!("rate below floor");
+    }
 
     // Trial support: Allow starting a stream with 0 initial balance
     if amount > 0 {
         let token_client = TokenClient::new(env, token);
-        token_client.transfer(payer, &env.current_contract_address(), &amount);
+        token_client.transfer(payer, env.current_contract_address(), &amount);
     }
 
     let now = env.ledger().timestamp();
@@ -1606,9 +1655,15 @@ fn subscribe_core(
     };
     set_subscription(env, &key, &sub);
 
-    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
+    let mut total_flow: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CurrentFlowRate(stream_id.clone()))
+        .unwrap_or(0);
     total_flow = total_flow.saturating_add(rate);
-    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
+    env.storage()
+        .persistent()
+        .set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
 
     for i in 0..creators_for_stats.len() {
         let creator = creators_for_stats.get(i).unwrap();

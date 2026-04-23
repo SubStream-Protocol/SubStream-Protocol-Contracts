@@ -32,32 +32,51 @@ fn test_tiny_stream_rounding() {
 
     // Suppose we want a stream of 1 unit every 2 seconds (0.5 units/sec).
     // Now we can specify it as 0.5 * PRECISION_MULTIPLIER = 500,000_000
-    let rate = 500_000_000; 
-    
+    let rate = 500_000_000;
+
     // Subscribe with 1000 units
-    client.subscribe(&subscriber, &creator, &token.address, &1000, &rate);
+    client.subscribe(&subscriber, &creator, &token.address, &1000, &rate, &None);
 
     let week = 7 * 24 * 60 * 60;
     env.ledger().set_timestamp(start + week + 100);
     client.collect(&subscriber, &creator);
 
     // 100 seconds after trial at 0.5 units/sec = 50 units.
-    assert_eq!(token.balance(&creator), 50, "Rate 0.5 should stream 50 units in 100 seconds");
+    assert_eq!(
+        token.balance(&creator),
+        50,
+        "Rate 0.5 should stream 50 units in 100 seconds"
+    );
 
     // Now let's try a very low but non-zero rate: 10 units per week.
     // 10 units / (7*24*3600) sec = 10 / 604800 units/sec.
     // Represented in nano: (10 * 10^9) / 604800 = 16534.
-    let tiny_rate = 16534; 
+    let tiny_rate = 16534;
     let subscriber2 = Address::generate(&env);
     token_admin.mint(&subscriber2, &1_000_000_000);
-    client.subscribe(&subscriber2, &creator, &token.address, &1000, &tiny_rate);
-    
-    env.ledger().set_timestamp(start + week + week + week + 100); 
+    client.subscribe(
+        &subscriber2,
+        &creator,
+        &token.address,
+        &1000,
+        &tiny_rate,
+        &None,
+    );
+
+    env.ledger().set_timestamp(start + week + week + week + 100);
     client.collect(&subscriber2, &creator);
-    assert_eq!(token.balance(&creator), 50 + 9, "Should be 9 units (9.9997 accrued)");
+    assert_eq!(
+        token.balance(&creator),
+        50 + 9,
+        "Should be 9 units (9.9997 accrued)"
+    );
 
     // Wait 100 more seconds - the 0.0003 remainder + 100 * 16534 should reach 10 units
     env.ledger().set_timestamp(start + week + week + week + 200);
     client.collect(&subscriber2, &creator);
-    assert_eq!(token.balance(&creator), 50 + 10, "Should have accumulated enough dust to reach 10th unit");
+    assert_eq!(
+        token.balance(&creator),
+        50 + 10,
+        "Should have accumulated enough dust to reach 10th unit"
+    );
 }

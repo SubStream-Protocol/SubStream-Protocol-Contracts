@@ -1,10 +1,10 @@
 #![cfg(test)]
 
+use super::{SubStreamContract, SubStreamContractClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, vec, Address, Env, Vec,
 };
-use super::{SubStreamContract, SubStreamContractClient};
 
 const DAY: u64 = 24 * 60 * 60;
 const WEEK: u64 = 7 * DAY;
@@ -55,7 +55,7 @@ fn test_withdrawal_consistency_high_load() {
         let rate: i128 = 1 + ((i as i128 * 13) % 100);
 
         // Subscribe
-        client.subscribe(&subscriber, &creator, &sac.address(), &amount, &rate);
+        client.subscribe(&subscriber, &creator, &sac.address(), &amount, &rate, &None);
     }
 
     // Verify initial vault balance
@@ -99,7 +99,8 @@ fn test_withdrawal_consistency_high_load() {
                 assert!(
                     contract_balance_before >= 0,
                     "CRITICAL: Vault balance went negative before cancellation #{}: {}",
-                    i, contract_balance_before
+                    i,
+                    contract_balance_before
                 );
 
                 // Cancel subscription - this refunds remaining balance
@@ -163,17 +164,24 @@ fn test_withdrawal_consistency_edge_cases() {
     // Test edge case: minimum amounts
     let subscriber1 = Address::generate(&env);
     token_admin.mint(&subscriber1, &1000);
-    client.subscribe(&subscriber1, &creator, &sac.address(), &100, &1);
+    client.subscribe(&subscriber1, &creator, &sac.address(), &100, &1, &None);
 
     // Test edge case: large amounts
     let subscriber2 = Address::generate(&env);
     token_admin.mint(&subscriber2, &1000000);
-    client.subscribe(&subscriber2, &creator, &sac.address(), &500000, &1000);
+    client.subscribe(
+        &subscriber2,
+        &creator,
+        &sac.address(),
+        &500000,
+        &1000,
+        &None,
+    );
 
     // Test edge case: high rate
     let subscriber3 = Address::generate(&env);
     token_admin.mint(&subscriber3, &10000);
-    client.subscribe(&subscriber3, &creator, &sac.address(), &5000, &500);
+    client.subscribe(&subscriber3, &creator, &sac.address(), &5000, &500, &None);
 
     env.ledger().set_timestamp(100 + WEEK + DAY);
 
@@ -184,17 +192,29 @@ fn test_withdrawal_consistency_edge_cases() {
 
     // Cancel all
     client.cancel(&subscriber1, &creator);
-    
+
     let balance_after_cancel1 = token_client.balance(&contract_id);
-    assert!(balance_after_cancel1 >= 0, "Vault negative after cancel1: {}", balance_after_cancel1);
+    assert!(
+        balance_after_cancel1 >= 0,
+        "Vault negative after cancel1: {}",
+        balance_after_cancel1
+    );
 
     client.cancel(&subscriber2, &creator);
-    
+
     let balance_after_cancel2 = token_client.balance(&contract_id);
-    assert!(balance_after_cancel2 >= 0, "Vault negative after cancel2: {}", balance_after_cancel2);
+    assert!(
+        balance_after_cancel2 >= 0,
+        "Vault negative after cancel2: {}",
+        balance_after_cancel2
+    );
 
     client.cancel(&subscriber3, &creator);
-    
+
     let final_balance = token_client.balance(&contract_id);
-    assert!(final_balance >= 0, "Vault negative after cancel3: {}", final_balance);
+    assert!(
+        final_balance >= 0,
+        "Vault negative after cancel3: {}",
+        final_balance
+    );
 }
