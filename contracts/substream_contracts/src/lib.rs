@@ -1,8 +1,13 @@
 #![no_std]
+<<<<<<< feature/advanced-subscription-engine-bundle
+use soroban_sdk::token::Client as TokenClient;
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Bytes, Env, IntoVal, Vec};
+=======
 #[cfg(test)]
 extern crate std;
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
+>>>>>>> main
 
 // --- Constants ---
 const MINIMUM_FLOW_DURATION: u64 = 86400;
@@ -61,6 +66,39 @@ fn calculate_discounted_charge(
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+<<<<<<< feature/advanced-subscription-engine-bundle
+    Stream(Address, Address),        // (subscriber, creator)
+    TotalStreamed(Address, Address), // (subscriber, creator) - cumulative tokens streamed
+    CliffThreshold(Address),         // creator -> threshold amount for access
+    CreatorSubscribers(Address),     // creator -> Vec<subscriber>
+    CreatorMetadata(Address),        // creator -> IPFS CID bytes
+    ChannelPaused(Address),          // creator -> bool
+    Escrow(Address, Address),        // (subscriber, merchant)
+    Nullifier(Bytes),                // ZK nullifier tracking
+    YieldConfig(Address),            // merchant -> YieldConfig
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowVault {
+    pub token: Address,
+    pub merchant: Address,
+    pub subscriber: Address,
+    pub total_amount: i128,
+    pub vested_amount: i128,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub last_drip: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldConfig {
+    pub target_protocol: Address,
+    pub user_share_bps: u32,     // bps (0-10000)
+    pub merchant_share_bps: u32,
+    pub dao_share_bps: u32,
+=======
     Subscription(Address, Address),
     TotalStreamed(Address, Address),
     CliffThreshold(Address),
@@ -84,6 +122,7 @@ pub enum DataKey {
     PlanRegistry(Address),             // Merchant's pricing plans registry
     TrialUsed(Address, Address),      // (user, merchant) - Prevent trial abuse
     BillingCycle(Address, Address),    // (subscriber, merchant) - Billing cycle info
+>>>>>>> main
 }
 
 #[contracttype]
@@ -227,12 +266,56 @@ pub struct TipReceived {
 }
 
 #[contractevent]
+<<<<<<< feature/advanced-subscription-engine-bundle
+pub struct CrossAssetBilled {
+    #[topic]
+    pub subscriber: Address,
+    #[topic]
+    pub merchant: Address,
+    pub asset_in: Address,
+    pub asset_out: Address,
+    pub amount_in: i128,
+    pub amount_out: i128,
+}
+
+#[contractevent]
+pub struct AnnualEscrowLocked {
+    #[topic]
+    pub subscriber: Address,
+    #[topic]
+    pub merchant: Address,
+    pub amount: i128,
+    pub duration_months: u32,
+}
+
+#[contractevent]
+pub struct YieldHarvested {
+    #[topic]
+    pub merchant: Address,
+    pub profit: i128,
+    pub user_distributed: i128,
+    pub merchant_distributed: i128,
+    pub dao_distributed: i128,
+}
+
+#[contractevent]
+pub struct AccessGranted {
+    #[topic]
+    pub merchant: Address,
+    #[topic]
+    pub nullifier: Bytes,
+}
+
+#[contract]
+pub struct SubStreamContract;
+=======
 pub struct CreatorVerified {
     #[topic]
     pub creator: Address,
     #[topic]
     pub verified_by: Address,
 }
+>>>>>>> main
 
 #[contractevent]
 pub struct ReferralRegistered {
@@ -280,6 +363,8 @@ pub struct SubscriptionBilled {
     pub billed_at: u64,
 }
 
+<<<<<<< feature/advanced-subscription-engine-bundle
+=======
 #[contractevent]
 pub struct TrialStarted {
     #[topic] pub subscriber: Address,
@@ -355,6 +440,7 @@ impl SubStreamContract {
             .get(&DataKey::VerifiedCreator(creator))
             .unwrap_or(false)
     }
+>>>>>>> main
 
     pub fn subscribe(
         env: Env,
@@ -585,8 +671,35 @@ impl SubStreamContract {
             panic!("user not blacklisted");
         }
 
+<<<<<<< feature/advanced-subscription-engine-bundle
+        // Collect any pending earnings before changing rate
+        distribute_and_collect(&env, &subscriber, &creator, Some(&creator));
+        stream = get_stream(&env, &key);
+
+        stream.tier.rate_per_second = new_rate_per_second;
+        set_stream(&env, &key, &stream);
+
+        TierChanged {
+            subscriber: subscriber.clone(),
+            creator: creator.clone(),
+            old_rate,
+            new_rate: new_rate_per_second,
+        }.publish(&env);
+    }
+
+    /// Collect from all active streams for a creator in a single call.
+    /// `max_count` caps the batch size to avoid hitting ledger instruction limits.
+    /// Returns the total amount collected across all processed streams.
+    pub fn withdraw_all(env: Env, creator: Address, max_count: u32) -> i128 {
+        let subs_key = DataKey::CreatorSubscribers(creator.clone());
+        let subs: Vec<Address> = env.storage().persistent().get(&subs_key).unwrap_or(vec![&env]);
+
+        let mut total: i128 = 0;
+        let limit = max_count.min(subs.len());
+=======
         // Remove from blacklist
         env.storage().persistent().remove(&blacklist_key);
+>>>>>>> main
 
         // Emit event
         UserUnblacklisted {
@@ -723,6 +836,146 @@ impl SubStreamContract {
             billed_at: now,
         }.publish(&env);
     }
+<<<<<<< feature/advanced-subscription-engine-bundle
+
+    /// #105: Cross-Asset Subscription Auto-Swaps
+    /// Allows a user to pay in one asset and the merchant to receive another.
+    pub fn execute_subscription_pull(
+        env: Env,
+        subscriber: Address,
+        merchant: Address,
+        asset_in: Address,
+        amount_in_max: i128,
+        asset_out: Address,
+        amount_out: i128,
+        dex_address: Address,
+    ) {
+        subscriber.require_auth();
+
+        if asset_in == asset_out {
+            let token_client = TokenClient::new(&env, &asset_in);
+            token_client.transfer(&subscriber, &merchant, &amount_out);
+        } else {
+            let token_in = TokenClient::new(&env, &asset_in);
+            
+            // Atomic swap logic
+            token_in.transfer(&subscriber, &env.current_contract_address(), &amount_in_max);
+            
+            // Mocking the cross-contract DEX call
+            // In a real implementation, this would call a swap function on a DEX contract
+            let amount_spent: i128 = env.invoke_contract(
+                &dex_address,
+                &soroban_sdk::symbol_short!("swap"),
+                vec![
+                    &env,
+                    asset_in.clone().into_val(&env),
+                    asset_out.clone().into_val(&env),
+                    amount_in_max.into_val(&env),
+                    amount_out.into_val(&env),
+                ],
+            );
+
+            let token_out = TokenClient::new(&env, &asset_out);
+            token_out.transfer(&env.current_contract_address(), &merchant, &amount_out);
+
+            // Refund surplus to user
+            let surplus = amount_in_max - amount_spent;
+            if surplus > 0 {
+                token_in.transfer(&env.current_contract_address(), &subscriber, &surplus);
+            }
+
+            CrossAssetBilled {
+                subscriber,
+                merchant,
+                asset_in,
+                asset_out,
+                amount_in: amount_spent,
+                amount_out,
+            }.publish(&env);
+        }
+    }
+
+    /// #106: "Pre-Authorization" Escrow Vaults for Annual Plans
+    pub fn deposit_to_escrow(
+        env: Env,
+        subscriber: Address,
+        merchant: Address,
+        token: Address,
+        amount: i128,
+        duration_months: u32,
+    ) {
+        subscriber.require_auth();
+        let token_client = TokenClient::new(&env, &token);
+        token_client.transfer(&subscriber, &env.current_contract_address(), &amount);
+
+        let now = env.ledger().timestamp();
+        let duration_seconds = (duration_months as u64) * 30 * 24 * 60 * 60;
+        
+        let vault = EscrowVault {
+            token,
+            merchant: merchant.clone(),
+            subscriber: subscriber.clone(),
+            total_amount: amount,
+            vested_amount: 0,
+            start_time: now,
+            end_time: now + duration_seconds,
+            last_drip: now,
+        };
+
+        env.storage().persistent().set(&DataKey::Escrow(subscriber.clone(), merchant.clone()), &vault);
+
+        AnnualEscrowLocked {
+            subscriber: subscriber.clone(),
+            merchant: merchant.clone(),
+            amount,
+            duration_months,
+        }.publish(&env);
+    }
+
+    pub fn claim_drip(env: Env, subscriber: Address, merchant: Address) {
+        let key = DataKey::Escrow(subscriber.clone(), merchant.clone());
+        let mut vault: EscrowVault = env.storage().persistent().get(&key).expect("no escrow found");
+        
+        let now = env.ledger().timestamp();
+        if now <= vault.last_drip {
+            return;
+        }
+
+        let total_duration = (vault.end_time - vault.start_time) as i128;
+        if total_duration == 0 { return; }
+
+        let elapsed = (now.min(vault.end_time) - vault.last_drip) as i128;
+        let drip_amount = (vault.total_amount * elapsed) / total_duration;
+
+        if drip_amount > 0 {
+            let token_client = TokenClient::new(&env, &vault.token);
+            token_client.transfer(&env.current_contract_address(), &merchant, &drip_amount);
+            vault.vested_amount += drip_amount;
+            vault.last_drip = now.min(vault.end_time);
+            env.storage().persistent().set(&key, &vault);
+        }
+    }
+
+    pub fn refund_unvested(env: Env, subscriber: Address, merchant: Address) {
+        subscriber.require_auth();
+        let key = DataKey::Escrow(subscriber.clone(), merchant.clone());
+        let vault: EscrowVault = env.storage().persistent().get(&key).expect("no escrow found");
+        
+        let unvested = vault.total_amount - vault.vested_amount;
+        if unvested > 0 {
+            let token_client = TokenClient::new(&env, &vault.token);
+            token_client.transfer(&env.current_contract_address(), &subscriber, &unvested);
+        }
+        
+        env.storage().persistent().remove(&key);
+    }
+
+    /// #108: Merchant Yield Routing for Idle Escrow Vaults
+    pub fn set_yield_config(env: Env, merchant: Address, config: YieldConfig) {
+        merchant.require_auth();
+        if config.user_share_bps + config.merchant_share_bps + config.dao_share_bps != 10000 {
+            panic!("shares must sum to 10000 bps");
+=======
     
     // #102: Enhanced Trial Period and Auto-Conversion
     pub fn initialize_subscription(
@@ -783,8 +1036,67 @@ impl SubStreamContract {
                 trial_duration: plan.trial_duration,
                 started_at: now,
             }.publish(&env);
+>>>>>>> main
         }
+        env.storage().persistent().set(&DataKey::YieldConfig(merchant), &config);
+    }
+
+    pub fn route_escrow_to_yield(env: Env, subscriber: Address, merchant: Address, amount: i128) {
+        merchant.require_auth(); // Only merchant or relayer can route? Issue says protocol relayer.
+        let key = DataKey::Escrow(subscriber.clone(), merchant.clone());
+        let vault: EscrowVault = env.storage().persistent().get(&key).expect("no escrow found");
         
+<<<<<<< feature/advanced-subscription-engine-bundle
+        // Buffer: ensure we keep at least 30 days of drips in the contract
+        let total_duration = (vault.end_time - vault.start_time) as i128;
+        let monthly_buffer = (vault.total_amount * (30 * 24 * 60 * 60)) / total_duration;
+        let current_unvested = vault.total_amount - vault.vested_amount;
+        
+        if amount > (current_unvested - monthly_buffer) {
+            panic!("liquidity buffer violation");
+        }
+
+        let config: YieldConfig = env.storage().persistent().get(&DataKey::YieldConfig(merchant.clone())).expect("yield not configured");
+        let token_client = TokenClient::new(&env, &vault.token);
+        token_client.transfer(&env.current_contract_address(), &config.target_protocol, &amount);
+    }
+
+    pub fn harvest_yield(env: Env, merchant: Address, profit: i128) {
+        let config: YieldConfig = env.storage().persistent().get(&DataKey::YieldConfig(merchant.clone())).expect("yield not configured");
+        
+        let user_amount = (profit * config.user_share_bps as i128) / 10000;
+        let merchant_amount = (profit * config.merchant_share_bps as i128) / 10000;
+        let dao_amount = profit - user_amount - merchant_amount;
+
+        // In a real scenario, we'd pull from the protocol and distribute.
+        // For now, we emit the event.
+        YieldHarvested {
+            merchant,
+            profit,
+            user_distributed: user_amount,
+            merchant_distributed: merchant_amount,
+            dao_distributed: dao_amount,
+        }.publish(&env);
+    }
+
+    /// #107: ZK-Proof Anonymous Subscription Verification
+    pub fn verify_anonymous_subscription(env: Env, merchant: Address, proof: Bytes, nullifier: Bytes) {
+        if env.storage().persistent().has(&DataKey::Nullifier(nullifier.clone())) {
+            panic!("replay attack detected");
+        }
+
+        // Mock ZK verification: proofs must be 64 bytes for this mock
+        if proof.len() != 64 {
+            panic!("invalid ZK proof");
+        }
+
+        env.storage().persistent().set(&DataKey::Nullifier(nullifier.clone()), &true);
+
+        AccessGranted {
+            merchant,
+            nullifier,
+        }.publish(&env);
+=======
         // Create subscription using existing logic
         let tier = Tier {
             rate_per_second: plan.billing_amount / plan.billing_cycle as i128,
@@ -915,6 +1227,7 @@ impl SubStreamContract {
         } else {
             SubscriptionStatus::Canceled
         }
+>>>>>>> main
     }
 
 // --- Internal Logic & Helpers ---
@@ -1388,6 +1701,10 @@ fn get_current_plan_id(env: &Env, merchant: &Address, billing_amount: i128) -> u
     0 // Default plan ID if not found
 }
 
+<<<<<<< feature/advanced-subscription-engine-bundle
+// mod test;
+mod test_issues;
+=======
 } // <--- Added this closing brace
 
 #[cfg(test)]
@@ -1398,3 +1715,4 @@ mod test_tiny_streams;
 mod test_withdrawal_consistency;
 #[cfg(test)]
 mod test_enhanced_subscriptions;
+>>>>>>> main
