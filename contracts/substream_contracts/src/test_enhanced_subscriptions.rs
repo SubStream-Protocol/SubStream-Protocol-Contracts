@@ -53,7 +53,7 @@ fn test_execute_subscription_pull_success() {
     client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
 
     // Set up allowance
-    token_client.approve(&subscriber, &contract_id, &1000);
+    token.approve(&subscriber, &contract_id, &1000, &1_000_000u32);
 
     // Jump to billing date
     env.ledger().set_timestamp(1000 + MONTH);
@@ -172,7 +172,7 @@ fn test_trial_period_auto_conversion() {
     );
 
     // Set up allowance for after trial
-    token_client.approve(&subscriber, &contract_id, &1000);
+    token.approve(&subscriber, &contract_id, &1000, &1_000_000u32);
 
     // Jump past trial period
     env.ledger().set_timestamp(1000 + 7 * DAY + 1);
@@ -282,7 +282,7 @@ fn test_grace_period_entry_and_recovery() {
     }));
 
     // Now provide allowance and recover
-    token_client.approve(&subscriber, &contract_id, &1000);
+    token.approve(&subscriber, &contract_id, &1000, &1_000_000u32);
     
     // Should succeed within grace period
     client.execute_subscription_pull(&merchant, &subscriber);
@@ -501,7 +501,7 @@ fn test_full_subscription_lifecycle() {
     );
 
     // Set up allowance for post-trial billing
-    token_client.approve(&subscriber, &contract_id, &1000);
+    token.approve(&subscriber, &contract_id, &1000, &1_000_000u32);
 
     // Jump past trial and upgrade to pro
     env.ledger().set_timestamp(1000 + 7 * DAY + 1);

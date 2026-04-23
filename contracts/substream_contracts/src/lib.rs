@@ -1,13 +1,18 @@
-#![no_std]
+﻿#![no_std]
 #[cfg(test)]
 extern crate std;
+
+mod billing_dispute;
 use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractevent, contractimpl, contracttype, vec, Address, Bytes, BytesN, Env, Symbol,
+    Vec,
+};
 
 // --- Constants ---
-const MINIMUM_FLOW_DURATION: u64 = 86400;
-const FREE_TRIAL_DURATION: u64 = 7 * 24 * 60 * 60;
-const GRACE_PERIOD: u64 = 24 * 60 * 60;
+pub(crate) const MINIMUM_FLOW_DURATION: u64 = 86400;
+pub(crate) const FREE_TRIAL_DURATION: u64 = 7 * 24 * 60 * 60;
+pub(crate) const GRACE_PERIOD: u64 = 24 * 60 * 60;
 const GENESIS_NFT_ADDRESS: &str = "CAS3J7GYCCX7RRBHAHXDUY3OOWFMTIDDNVGCH6YOY7W7Y7G656H2HHMA";
 const DISCOUNT_BPS: i128 = 2000;
 const SIX_MONTHS: u64 = 180 * 24 * 60 * 60;
@@ -23,9 +28,12 @@ const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
 const UPTIME_ORACLE_NONCE_TTL: u64 = 24 * 60 * 60; // 24 hour validity for oracle signatures
 
 // --- Merchant Registry and KYC Whitelisting Constants ---
-const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
+pub(crate) const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
 const MERCHANT_KYC_VALIDITY: u64 = 365 * 24 * 60 * 60; // 1 year validity for KYC credentials
 const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
+
+// --- Subscription billing / dispute escrow ---
+pub(crate) const DISPUTE_WINDOW_SEC: u64 = 48 * 60 * 60;
 
 // --- Helper: Charge Calculation ---
 fn calculate_discounted_charge(
@@ -71,6 +79,7 @@ fn calculate_discounted_charge(
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    Subscription(Address, Address),
     Stream(Address, Address),
     TotalStreamed(Address, Address),
     CliffThreshold(Address),
@@ -80,27 +89,37 @@ pub enum DataKey {
     Escrow(Address, Address),
     Nullifier(Bytes),
     YieldConfig(Address),
-    SLAStatus(Address),               // Merged from main
-    UptimeOracleNonce(u64),           // Merged from main
-    ContractAdmin,                    // Integrated for verify_creator
+    SLAStatus(Address),
+    UptimeOracleNonce(u64),
+    ContractAdmin,
     VerifiedCreator(Address),
     UserReferrer(Address),
     ReferralTracker(Address, Address),
-    CurrentFlowRate(Address),          // Aggregated flow rate for a channel
-    AcceptedToken(Address),            // Issue #49: Creator's enforced stablecoin token
-    PlanRegistry(Address),             // Merchant's pricing plans registry
-    TrialUsed(Address, Address),      // (user, merchant) - Prevent trial abuse
-    BillingCycle(Address, Address),    // (subscriber, merchant) - Billing cycle info
-    SLAStatus(Address),               // Creator's SLA status
-    UptimeOracleNonce(u64),           // Oracle nonce tracking
-    // --- Merchant Registry and KYC Whitelisting Keys ---
-    MerchantRegistry(Address),        // Merchant registration and verification status
-    KYCCredential(Address),           // SEP-12 KYC credential for merchant
-    DAOProposal(u64),                 // DAO proposal for merchant approval
-    DAOVote(Address, u64),           // DAO member vote on proposal
-    BlacklistedMerchant(Address),     // Blacklisted merchant status
-    // --- Global Reentrancy Guard Keys ---
-    ReentrancyGuard,                 // Global reentrancy protection state
+    CurrentFlowRate(Address),
+    AcceptedToken(Address),
+    PlanRegistry(Address),
+    TrialUsed(Address, Address),
+    BillingCycle(Address, Address),
+    BlacklistedUser(Address, Address),
+    MinimumRate(Address),
+    CommunityGoal(Address),
+    CreatorAudience(Address, Address),
+    MerchantRegistry(Address),
+    KYCCredential(Address),
+    DAOProposal(u64),
+    DAOVote(Address, u64),
+    BlacklistedMerchant(Address),
+    /// Last pull amount held in-contract until dispute window elapses or dispute resolves.
+    PendingMerchantPull(Address, Address),
+    /// Active dispute id per (subscriber, merchant) if any.
+    ActiveDispute(Address, Address),
+    /// Monotonic dispute id counter.
+    NextDisputeId,
+    /// Dispute details keyed by dispute_id.
+    DisputeRecord(u64),
+    /// DAO juror ed25519 public keys (32 bytes each).
+    DisputeJurorKeys,
+    ReentrancyGuard,
 }
 
 #[contracttype]
@@ -198,6 +217,8 @@ pub enum SubscriptionStatus {
     PastDue,
     Canceled,
     Trial,
+    /// Pulls paused; last billed amount held in dispute escrow pending juror verdict.
+    Disputed,
 }
 
 #[contracttype]
@@ -208,6 +229,35 @@ pub struct BillingCycleInfo {
     pub status: SubscriptionStatus,
     pub billing_amount: i128,
     pub billing_cycle: u64,
+}
+
+/// Snapshot of the last executed pull (used for the 48h dispute window).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingMerchantPullInfo {
+    pub amount: i128,
+    pub token: Address,
+    pub pulled_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    pub dispute_id: u64,
+    pub subscriber: Address,
+    pub merchant: Address,
+    pub disputed_amount: i128,
+    pub bond_amount: i128,
+    pub token: Address,
+    pub raised_at: u64,
+    pub resolved: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JurorSignature {
+    pub pubkey: BytesN<32>,
+    pub sig: BytesN<64>,
 }
 
 // --- Merchant Registry and KYC Whitelisting Data Structures ---
@@ -388,6 +438,29 @@ pub struct SubscriptionBilled {
     #[topic] pub merchant: Address,
     #[topic] pub amount: i128,
     pub billed_at: u64,
+}
+
+#[contractevent]
+pub struct DisputeRaised {
+    #[topic] pub dispute_id: u64,
+    #[topic] pub subscriber: Address,
+    #[topic] pub merchant: Address,
+    pub disputed_amount: i128,
+    pub bond_amount: i128,
+    pub raised_at: u64,
+}
+
+#[contractevent]
+pub struct DisputeResolved {
+    #[topic] pub dispute_id: u64,
+    #[topic] pub subscriber: Address,
+    #[topic] pub merchant: Address,
+    pub user_wins: bool,
+    pub refunded_to_user: i128,
+    pub paid_to_merchant: i128,
+    pub bond_destination: Address,
+    pub bond_amount: i128,
+    pub resolved_at: u64,
 }
 
 #[contractevent]
@@ -868,43 +941,18 @@ impl SubStreamContract {
     
     /// Allow subscriber to cancel with immediate refund if SLA breach exceeds 7 days
     pub fn emergency_cancel_due_to_sla(env: Env, subscriber: Address, creator: Address) {
+        subscriber.require_auth();
         let sla_status = get_sla_status(&env, &creator);
-        
-        // Check if downtime exceeds 7 days (7 * 24 * 60 = 10080 minutes)
+
         if sla_status.cumulative_downtime_minutes < 10080 {
             panic!("SLA emergency cancellation only available after 7+ days of downtime");
         }
-        
+
         if !sla_status.active {
             panic!("SLA emergency cancellation only available during active breach");
         }
-        
-        // Perform immediate cancellation with full refund
+
         cancel_internal(&env, &subscriber, &creator);
-        
-        let subscription = Subscription {
-            token: token.clone(),
-            tier,
-            balance: 0, // Start with zero balance for trial
-            last_collected: now,
-            start_time: now,
-            last_funds_exhausted: 0,
-            free_to_paid_emitted: false,
-            creators: vec![&env, merchant.clone()],
-            percentages: vec![&env, 100u32],
-            payer: subscriber.clone(),
-            beneficiary: subscriber.clone(),
-            accrued_remainder: 0,
-        };
-        
-        let sub_key = subscription_key(&subscriber, &merchant);
-        set_subscription(&env, &sub_key, &subscription);
-        
-        Subscribed {
-            subscriber: subscriber.clone(),
-            creator: merchant.clone(),
-            rate_per_second: plan.billing_amount / plan.billing_cycle as i128,
-        }.publish(&env);
     }
     
     // #104: Tiered Subscription Upgrades and Proration Math
@@ -971,7 +1019,7 @@ impl SubStreamContract {
         SubscriptionUpgraded {
             subscriber: subscriber.clone(),
             merchant: merchant.clone(),
-            old_tier_id,
+            old_tier_id: old_plan_id,
             new_tier_id,
             prorated_charge,
             upgraded_at: now,
@@ -981,12 +1029,7 @@ impl SubStreamContract {
     // Helper function for merchants to register plans
     pub fn register_plan(env: Env, merchant: Address, plan: Plan) {
         merchant.require_auth();
-        
-        // Check if merchant is verified
-        if !is_merchant_verified(&env, &merchant) {
-            panic!("merchant is not verified");
-        }
-        
+
         let plan_registry_key = DataKey::PlanRegistry(merchant.clone());
         let mut plans: soroban_sdk::Vec<Plan> = env.storage().persistent()
             .get(&plan_registry_key)
@@ -1225,15 +1268,91 @@ impl SubStreamContract {
             .expect("merchant not found")
     }
 
-    fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
-        DataKey::Subscription(subscriber.clone(), stream_id.clone())
+    pub fn configure_dispute_jurors(env: Env, admin: Address, juror_pubkeys: Vec<BytesN<32>>) {
+        billing_dispute::configure_dispute_jurors(&env, &admin, juror_pubkeys);
+    }
+
+    pub fn initialize_subscription(
+        env: Env,
+        subscriber: Address,
+        merchant: Address,
+        plan_id: u32,
+        token: Address,
+    ) {
+        billing_dispute::initialize_subscription(&env, subscriber, merchant, plan_id, token);
+    }
+
+    pub fn execute_subscription_pull(env: Env, merchant: Address, subscriber: Address) {
+        billing_dispute::execute_subscription_pull(&env, merchant, subscriber);
+    }
+
+    pub fn raise_dispute(env: Env, subscriber: Address, merchant: Address, bond_amount: i128) {
+        billing_dispute::raise_dispute(&env, subscriber, merchant, bond_amount);
+    }
+
+    pub fn resolve_dispute_for_user(
+        env: Env,
+        subscriber: Address,
+        merchant: Address,
+        dispute_id: u64,
+        juror_sigs: Vec<JurorSignature>,
+    ) {
+        billing_dispute::resolve_dispute_for_user(
+            &env,
+            subscriber,
+            merchant,
+            dispute_id,
+            juror_sigs,
+        );
+    }
+
+    pub fn resolve_dispute_for_merchant(
+        env: Env,
+        subscriber: Address,
+        merchant: Address,
+        dispute_id: u64,
+        juror_sigs: Vec<JurorSignature>,
+    ) {
+        billing_dispute::resolve_dispute_for_merchant(
+            &env,
+            subscriber,
+            merchant,
+            dispute_id,
+            juror_sigs,
+        );
+    }
+
+    pub fn release_expired_pending_pull(env: Env, subscriber: Address, merchant: Address) {
+        let c = env.current_contract_address();
+        billing_dispute::maybe_release_expired_pending_pull(&env, &subscriber, &merchant, &c);
+    }
+
+    pub fn get_active_dispute_id(
+        env: Env,
+        subscriber: Address,
+        merchant: Address,
+    ) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveDispute(subscriber, merchant))
+    }
+
+    pub fn get_dispute_record(env: Env, dispute_id: u64) -> Option<DisputeRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeRecord(dispute_id))
+    }
 }
 
-fn subscription_exists(env: &Env, key: &DataKey) -> bool {
+pub(crate) fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
+    DataKey::Subscription(subscriber.clone(), stream_id.clone())
+}
+
+pub(crate) fn subscription_exists(env: &Env, key: &DataKey) -> bool {
     env.storage().persistent().has(key) || env.storage().temporary().has(key)
 }
 
-fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
+pub(crate) fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
     if let Some(sub) = env.storage().persistent().get(key) {
         sub
     } else {
@@ -1241,7 +1360,7 @@ fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
     }
 }
 
-fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
+pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
     if sub.balance > 0 {
         env.storage().persistent().set(key, sub);
         env.storage().temporary().remove(key);
@@ -1278,7 +1397,7 @@ fn set_creator_stats(env: &Env, creator: &Address, stats: &CreatorStats) {
         .set(&DataKey::CreatorMetadata(creator.clone()), stats);
 }
 
-fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
+pub(crate) fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
     let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
     let mut relationship: CreatorAudience = env
         .storage()
@@ -1306,7 +1425,7 @@ fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address)
     set_creator_stats(env, creator, &stats);
 }
 
-fn unregister_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
+pub(crate) fn unregister_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
     let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
     let Some(mut relationship): Option<CreatorAudience> =
         env.storage().persistent().get(&relationship_key)
@@ -1544,8 +1663,13 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
 
     for i in 0..sub.creators.len() {
         let creator = sub.creators.get(i).unwrap();
-        unregister_creator_support(env, &creator, subscriber);
+        unregister_creator_support(env, &creator, beneficiary);
     }
+    let billing_key = DataKey::BillingCycle(beneficiary.clone(), stream_id.clone());
+    env.storage().persistent().remove(&billing_key);
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingMerchantPull(beneficiary.clone(), stream_id.clone()));
     env.storage().persistent().remove(&key);
     env.storage().temporary().remove(&key);
 }
@@ -1777,7 +1901,7 @@ fn subscription_exists(env: &Env, key: &DataKey) -> bool {
     env.storage().persistent().has(key) || env.storage().temporary().has(key)
 }
 
-fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
+pub(crate) fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
     if let Some(sub) = env.storage().persistent().get(key) {
         sub
     } else {
@@ -1785,7 +1909,7 @@ fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
     }
 }
 
-fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
+pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
     if sub.balance > 0 {
         env.storage().persistent().set(key, sub);
         env.storage().temporary().remove(key);
@@ -1826,7 +1950,7 @@ fn set_creator_stats(env: &Env, creator: &Address, stats: &CreatorStats) {
         .set(&DataKey::CreatorMetadata(creator.clone()), stats);
 }
 
-fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
+pub(crate) fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
     let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
     let mut relationship: CreatorAudience = env
         .storage()
@@ -1854,7 +1978,7 @@ fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address)
     set_creator_stats(env, creator, &stats);
 }
 
-fn unregister_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
+pub(crate) fn unregister_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
     let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
     let Some(mut relationship): Option<CreatorAudience> =
         env.storage().persistent().get(&relationship_key)
@@ -2270,3 +2394,5 @@ mod test_merchant_registry;
 mod test_formal_verification;
 #[cfg(test)]
 mod test_reentrancy_guard;
+#[cfg(test)]
+mod test_dispute_escrow;
