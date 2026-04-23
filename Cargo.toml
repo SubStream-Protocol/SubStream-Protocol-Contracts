@@ -22,13 +22,3 @@ lto = true
 [profile.release-with-logs]
 inherits = "release"
 debug-assertions = true
-
-# ==========================================
-# Issue #51: WASM Size Optimization Profile
-# ==========================================
-[profile.release]
-opt-level = "z"        # Optimize for size
-lto = true             # Enable Link Time Optimization (removes dead code)
-codegen-units = 1      # Compile crate as a single unit for maximum optimization
-panic = "abort"        # Remove panic unwinding (saves significant space)
-strip = "debuginfo"    # Strip debug info but keep symbols for error tracing
