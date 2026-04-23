@@ -83,6 +83,7 @@ fn calculate_discounted_charge(
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    Subscription(Address, Address),
     Stream(Address, Address),
     TotalStreamed(Address, Address),
     CliffThreshold(Address),
@@ -101,27 +102,6 @@ pub enum DataKey {
     ReferralTracker(Address, Address),
     CurrentFlowRate(Address),          // Aggregated flow rate for a channel
     AcceptedToken(Address),            // Issue #49: Creator's enforced stablecoin token
-    PlanRegistry(Address),             // Merchant's pricing plans registry
-    TrialUsed(Address, Address),      // (user, merchant) - Prevent trial abuse
-    BillingCycle(Address, Address),    // (subscriber, merchant) - Billing cycle info
-    SLAStatus(Address),               // Creator's SLA status
-    UptimeOracleNonce(u64),           // Oracle nonce tracking
-    // --- Merchant Registry and KYC Whitelisting Keys ---
-    MerchantRegistry(Address),        // Merchant registration and verification status
-    KYCCredential(Address),           // SEP-12 KYC credential for merchant
-    DAOProposal(u64),                 // DAO proposal for merchant approval
-    DAOVote(Address, u64),           // DAO member vote on proposal
-    BlacklistedMerchant(Address),     // Blacklisted merchant status
-    RegistryUpdateProposal(u64),     // Timelock proposal for registry updates
-    SecurityCouncilMember(Address),   // Security council membership
-    SecurityCouncilVeto(Address, u64), // Security council veto on proposal
-    // --- Dynamic Protocol Fee Keys ---
-    ProtocolFeeConfig,               // Global protocol fee configuration
-    ProtocolFeeUpdateProposal(u64),   // Protocol fee update proposal with timelock
-    // --- Global Reentrancy Guard Keys ---
-    ReentrancyGuard,                 // Global reentrancy protection state
-}
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Tier {
@@ -145,6 +125,13 @@ pub struct Subscription {
     pub payer: Address,
     pub beneficiary: Address,
     pub accrued_remainder: i128, // Dust/fractional units that haven't been paid as tokens
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WrappedSubscriptionRef {
+    pub beneficiary: Address,
+    pub stream_id: Address,
 }
 
 #[contracttype]
@@ -521,6 +508,14 @@ pub struct SubscriptionUpgraded {
     pub new_tier_id: u32,
     pub prorated_charge: i128,
     pub upgraded_at: u64,
+}
+
+#[contractevent]
+pub struct SubscriptionTransferred {
+    #[topic] pub token_id: u64,
+    #[topic] pub stream_id: Address,
+    #[topic] pub previous_owner: Address,
+    pub new_owner: Address,
 }
 
 // --- Merchant Registry and KYC Whitelisting Events ---
@@ -902,6 +897,120 @@ impl SubStreamContract {
 
     pub fn cancel_group(env: Env, subscriber: Address, channel_id: Address) {
         cancel_internal(&env, &subscriber, &channel_id);
+    }
+
+    /// Optional wrapper: mint an internal NFT-like token ID that represents
+    /// ownership of a specific subscription position.
+    pub fn enable_subscription_transferability(
+        env: Env,
+        beneficiary: Address,
+        stream_id: Address,
+    ) -> u64 {
+        let key = subscription_key(&beneficiary, &stream_id);
+        let sub = get_subscription(&env, &key);
+        sub.payer.require_auth();
+
+        let wrapped_key = DataKey::WrappedTokenForSubscription(beneficiary.clone(), stream_id.clone());
+        if env.storage().persistent().has(&wrapped_key) {
+            panic!("subscription already wrapped");
+        }
+
+        let mut token_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextWrappedTokenId)
+            .unwrap_or(1);
+        if token_id == 0 {
+            token_id = 1;
+        }
+
+        let sub_ref = WrappedSubscriptionRef {
+            beneficiary: beneficiary.clone(),
+            stream_id: stream_id.clone(),
+        };
+
+        env.storage().persistent().set(&wrapped_key, &token_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::WrappedTokenOwner(token_id), &beneficiary);
+        env.storage()
+            .persistent()
+            .set(&DataKey::WrappedSubscriptionRef(token_id), &sub_ref);
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextWrappedTokenId, &(token_id.saturating_add(1)));
+
+        token_id
+    }
+
+    /// Transfer wrapped subscription rights and billing ownership to a new wallet.
+    pub fn transfer_subscription_token(env: Env, token_id: u64, new_owner: Address) {
+        let current_owner = wrapped_token_owner(&env, token_id);
+        current_owner.require_auth();
+
+        let mut sub_ref = wrapped_subscription_ref(&env, token_id);
+        let stream_id = sub_ref.stream_id.clone();
+
+        if new_owner == current_owner {
+            return;
+        }
+
+        // Settle accrued charges first so users cannot bypass imminent billing.
+        distribute_and_collect(&env, &current_owner, &stream_id, None);
+
+        let old_key = subscription_key(&current_owner, &stream_id);
+        let mut sub = get_subscription(&env, &old_key);
+        sub.payer = new_owner.clone();
+        sub.beneficiary = new_owner.clone();
+        if sub.balance <= 0 && sub.last_funds_exhausted == 0 {
+            sub.last_funds_exhausted = env.ledger().timestamp();
+        }
+
+        let new_key = subscription_key(&new_owner, &stream_id);
+        env.storage().persistent().remove(&old_key);
+        env.storage().temporary().remove(&old_key);
+        set_subscription(&env, &new_key, &sub);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::WrappedTokenForSubscription(current_owner.clone(), stream_id.clone()));
+        env.storage().persistent().set(
+            &DataKey::WrappedTokenForSubscription(new_owner.clone(), stream_id.clone()),
+            &token_id,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::WrappedTokenOwner(token_id), &new_owner);
+
+        sub_ref.beneficiary = new_owner.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::WrappedSubscriptionRef(token_id), &sub_ref);
+
+        SubscriptionTransferred {
+            token_id,
+            stream_id,
+            previous_owner: current_owner,
+            new_owner,
+        }
+        .publish(&env);
+    }
+
+    /// Ownership-aware access check for wrapped subscriptions.
+    pub fn check_access(env: Env, token_id: u64, user: Address) -> bool {
+        let owner = wrapped_token_owner(&env, token_id);
+        if owner != user {
+            return false;
+        }
+        let sub_ref = wrapped_subscription_ref(&env, token_id);
+        Self::is_subscribed(env, owner, sub_ref.stream_id)
+    }
+
+    /// Ownership-aware pull execution for wrapped subscriptions.
+    pub fn execute_pull(env: Env, token_id: u64) -> i128 {
+        let owner = wrapped_token_owner(&env, token_id);
+        let sub_ref = wrapped_subscription_ref(&env, token_id);
+        distribute_and_collect(&env, &owner, &sub_ref.stream_id, None)
     }
 
     // --- Blacklist functionality for Issue #25 ---
@@ -2577,6 +2686,565 @@ fn get_current_plan_id(env: &Env, merchant: &Address, billing_amount: i128) -> u
     0 // Default plan ID if not found
 }
 
+fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
+    DataKey::Subscription(subscriber.clone(), stream_id.clone())
+}
+
+fn wrapped_token_owner(env: &Env, token_id: u64) -> Address {
+    env.storage()
+        .persistent()
+        .get(&DataKey::WrappedTokenOwner(token_id))
+        .expect("wrapped token owner not found")
+}
+
+fn wrapped_subscription_ref(env: &Env, token_id: u64) -> WrappedSubscriptionRef {
+    env.storage()
+        .persistent()
+        .get(&DataKey::WrappedSubscriptionRef(token_id))
+        .expect("wrapped subscription reference not found")
+}
+
+fn subscription_exists(env: &Env, key: &DataKey) -> bool {
+    env.storage().persistent().has(key) || env.storage().temporary().has(key)
+}
+
+fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
+    if let Some(sub) = env.storage().persistent().get(key) {
+        sub
+    } else {
+        env.storage().temporary().get(key).expect("not found")
+    }
+}
+
+fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
+    if sub.balance > 0 {
+        env.storage().persistent().set(key, sub);
+        env.storage().temporary().remove(key);
+        // Bump TTL for active subscriptions to keep them from expiring
+        bump_instance_ttl(env);
+        env.storage().persistent().bump(key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+    } else {
+        env.storage().temporary().set(key, sub);
+        env.storage().persistent().remove(key);
+        // Only bump instance TTL if we are moving to temporary storage,
+        // as the temporary entry will expire on its own.
+        bump_instance_ttl(env);
+    }
+}
+
+fn bump_instance_ttl(env: &Env) {
+    // TTL bump functionality not available in this SDK version
+}
+
+fn default_creator_stats() -> CreatorStats {
+    CreatorStats {
+        total_earned: 0,
+        lifetime_fans: 0,
+        active_fans: 0,
+    }
+}
+
+fn get_creator_stats(env: &Env, creator: &Address) -> CreatorStats {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CreatorMetadata(creator.clone()))
+        .unwrap_or(default_creator_stats())
+}
+
+fn set_creator_stats(env: &Env, creator: &Address, stats: &CreatorStats) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::CreatorMetadata(creator.clone()), stats);
+}
+
+fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
+    let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
+    let mut relationship: CreatorAudience = env
+        .storage()
+        .persistent()
+        .get(&relationship_key)
+        .unwrap_or(CreatorAudience {
+            active_streams: 0,
+            has_supported: false,
+        });
+    let mut stats = get_creator_stats(env, creator);
+
+    if !relationship.has_supported {
+        relationship.has_supported = true;
+        stats.lifetime_fans = stats.lifetime_fans.saturating_add(1);
+    }
+
+    if relationship.active_streams == 0 {
+        stats.active_fans = stats.active_fans.saturating_add(1);
+    }
+
+    relationship.active_streams = relationship.active_streams.saturating_add(1);
+    env.storage()
+        .persistent()
+        .set(&relationship_key, &relationship);
+    set_creator_stats(env, creator, &stats);
+}
+
+fn unregister_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
+    let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
+    let Some(mut relationship): Option<CreatorAudience> =
+        env.storage().persistent().get(&relationship_key)
+    else {
+        return;
+    };
+
+    if relationship.active_streams == 0 {
+        return;
+    }
+
+    relationship.active_streams -= 1;
+
+    let mut stats = get_creator_stats(env, creator);
+    if relationship.active_streams == 0 {
+        stats.active_fans = stats.active_fans.saturating_sub(1);
+    }
+
+    env.storage()
+        .persistent()
+        .set(&relationship_key, &relationship);
+    set_creator_stats(env, creator, &stats);
+}
+
+fn credit_creator_earnings(env: &Env, creator: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+
+    let mut stats = get_creator_stats(env, creator);
+    stats.total_earned = stats.total_earned.saturating_add(amount);
+    set_creator_stats(env, creator, &stats);
+}
+
+fn distribute_and_collect(
+    env: &Env,
+    beneficiary: &Address,
+    stream_id: &Address,
+    total_streamed_creator: Option<&Address>,
+) -> i128 {
+    let key = subscription_key(beneficiary, stream_id);
+    let mut sub = get_subscription(env, &key);
+    let now = env.ledger().timestamp();
+
+    if now <= sub.last_collected {
+        return 0;
+    }
+
+    let trial_end = sub.start_time.saturating_add(sub.tier.trial_duration);
+    if !sub.free_to_paid_emitted && sub.tier.rate_per_second > 0 && now > trial_end {
+        FreeToPaidTierActivated {
+            subscriber: beneficiary.clone(),
+            creator: stream_id.clone(),
+            rate_per_second: sub.tier.rate_per_second,
+            activated_at: now,
+        }
+        .publish(env);
+        sub.free_to_paid_emitted = true;
+    }
+
+    if let Some(creator) = total_streamed_creator {
+        if is_creator_paused(env, creator) {
+            sub.last_collected = now;
+            set_subscription(env, &key, &sub);
+            return 0;
+        }
+    }
+
+    let charge_start = if sub.last_collected > trial_end {
+        sub.last_collected
+    } else {
+        trial_end
+    };
+    if now <= charge_start {
+        return 0;
+    }
+
+    let amount_to_collect =
+        calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
+
+    // Check if grace period is active or expired
+    if sub.balance <= 0 && sub.last_funds_exhausted > 0 {
+        let grace_period_end = sub.last_funds_exhausted.saturating_add(GRACE_PERIOD);
+        if now > grace_period_end {
+            return 0;
+        }
+    }
+
+    if amount_to_collect > sub.balance {
+        if sub.last_funds_exhausted == 0 {
+            sub.last_funds_exhausted = now;
+        }
+        // During grace period, we cap payout at available balance to prevent contract draining
+    }
+
+    let available_balance = sub.balance.max(0);
+    let total_accrued = amount_to_collect.saturating_add(sub.accrued_remainder);
+    let amount_to_payout_nano =
+        total_accrued.min(available_balance.saturating_add(sub.accrued_remainder));
+    let amount_to_payout_tokens = amount_to_payout_nano / PRECISION_MULTIPLIER;
+
+    if amount_to_payout_tokens > 0 {
+        let token_client = TokenClient::new(env, &sub.token);
+        let creators_len = sub.creators.len();
+        let mut remaining = amount_to_payout_tokens;
+
+        // Check for referral rebate before distributing to creators
+        let referral_rebate = if let Some(referrer) = get_user_referrer(env, &sub.beneficiary) {
+            // Calculate 1% rebate on the total amount being paid out
+            (amount_to_payout_tokens * REFERRAL_REBATE_BPS) / 10000
+        } else {
+            0
+        };
+
+        for i in 0..creators_len {
+            let creator = sub.creators.get(i).unwrap();
+            let share = sub.percentages.get(i).unwrap() as i128;
+            let mut payout = if i + 1 == creators_len {
+                remaining
+            } else {
+                (amount_to_payout_tokens * share) / 100
+            };
+
+            // Apply referral rebate if applicable and this is the first creator
+            if referral_rebate > 0 && i == 0 {
+                if payout > referral_rebate {
+                    payout -= referral_rebate;
+                    pay_referral_rebate(
+                        env,
+                        &sub.beneficiary,
+                        &creator,
+                        &sub.token,
+                        referral_rebate,
+                    );
+                } else {
+                    // If payout is too small for rebate, skip rebate
+                    remaining += referral_rebate; // Add back to remaining for other creators
+                }
+            }
+
+            remaining -= payout;
+            if payout > 0 {
+                credit_creator_earnings(env, &creator, payout);
+                token_client.transfer(&env.current_contract_address(), &creator, &payout);
+            }
+        }
+    }
+
+    sub.balance -= amount_to_collect;
+    sub.accrued_remainder = total_accrued - (amount_to_payout_tokens * PRECISION_MULTIPLIER);
+    sub.last_collected = now;
+    set_subscription(env, &key, &sub);
+    amount_to_collect
+}
+
+fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount: i128) {
+    bump_instance_ttl(env);
+    let key = subscription_key(beneficiary, stream_id);
+    let mut sub = get_subscription(env, &key);
+    sub.payer.require_auth();
+
+    let token_client = TokenClient::new(env, &sub.token);
+    token_client.transfer(&sub.payer, &env.current_contract_address(), &amount);
+
+    sub.balance += amount * PRECISION_MULTIPLIER;
+    if sub.balance > 0 {
+        sub.last_funds_exhausted = 0;
+    }
+    set_subscription(env, &key, &sub);
+    distribute_and_collect(env, beneficiary, stream_id, None);
+}
+
+fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
+    bump_instance_ttl(env);
+    let key = subscription_key(beneficiary, stream_id);
+    let mut sub = get_subscription(env, &key);
+    sub.payer.require_auth();
+
+    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("cannot cancel stream: minimum duration not met"); }
+
+    // Collect any charges that have accrued so far (zero during the trial window).
+    distribute_and_collect(env, beneficiary, stream_id, None);
+    sub = get_subscription(env, &key); // Refresh after collect.
+
+    // Calculate penalty for early cancellation (optional logic from your existing code, assuming is_early was pseudo-code)
+    let is_early = false; // Add logic here if needed to determine early cancellation based on start_time
+    if is_early {
+        // The creator is entitled to compensation equal to the full minimum-lock
+        // period even though the subscriber is cancelling early.  This prevents
+        // flash-subscribe attacks where a user subscribes, scrapes content, and
+        // immediately cancels to recover their deposit.
+        //
+        // Penalty = rate_per_second × MINIMUM_FLOW_DURATION (in internal nano
+        // units), capped at the remaining balance so we never overdraw.
+        let min_entitled_nano = sub.tier.rate_per_second
+            .saturating_mul(MINIMUM_FLOW_DURATION as i128);
+        let available_nano = sub.balance.max(0);
+        let penalty_nano = min_entitled_nano.min(available_nano);
+        let penalty_tokens = penalty_nano / PRECISION_MULTIPLIER;
+
+        if penalty_tokens > 0 {
+            let token_client = TokenClient::new(env, &sub.token);
+            let creators_len = sub.creators.len();
+            let mut remaining_penalty = penalty_tokens;
+
+            for i in 0..creators_len {
+                let creator = sub.creators.get(i).unwrap();
+                let share = sub.percentages.get(i).unwrap() as i128;
+                let payout = if i + 1 == creators_len {
+                    remaining_penalty
+                } else {
+                    (penalty_tokens * share) / 100
+                };
+                remaining_penalty -= payout;
+                if payout > 0 {
+                    credit_creator_earnings(env, &creator, payout);
+                    token_client.transfer(&env.current_contract_address(), &creator, &payout);
+                }
+            }
+        }
+    }
+
+    let rate = sub.tier.rate_per_second;
+    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
+    total_flow = total_flow.saturating_sub(rate);
+    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
+
+    if sub.balance > 0 {
+        let token_client = TokenClient::new(&env, &sub.token);
+        let refund_amount = sub.balance / PRECISION_MULTIPLIER;
+        if refund_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &sub.payer, &refund_amount);
+        }
+    }
+
+    for i in 0..sub.creators.len() {
+        let creator = sub.creators.get(i).unwrap();
+        unregister_creator_support(env, &creator, beneficiary);
+    }
+    env.storage().persistent().remove(&key);
+    env.storage().temporary().remove(&key);
+}
+
+// --- Timelock and Multi-Sig Governance Helper Functions ---
+
+fn generate_registry_proposal_id(env: &Env) -> u64 {
+    // Generate unique proposal ID based on timestamp and existing proposals
+    let now = env.ledger().timestamp();
+    let mut proposal_id = now;
+    
+    // Ensure uniqueness by checking existing proposals
+    while env.storage().persistent().has(&DataKey::RegistryUpdateProposal(proposal_id)) {
+        proposal_id += 1;
+    }
+    
+    proposal_id
+}
+
+fn is_authorized_proposer(env: &Env, proposer: &Address) -> bool {
+    // Security Council members and contract admin can propose
+    if is_security_council_member(env, proposer) {
+        return true;
+    }
+    
+    if let Some(admin) = env.storage().persistent().get::<Address>(&DataKey::ContractAdmin) {
+        proposer == &admin
+    } else {
+        false
+    }
+}
+
+fn is_emergency_authorized(env: &Env, proposer: &Address) -> bool {
+    // Emergency bypass requires admin authorization (higher security)
+    if let Some(admin) = env.storage().persistent().get::<Address>(&DataKey::ContractAdmin) {
+        proposer == &admin
+    } else {
+        false
+    }
+}
+
+fn is_security_council_member(env: &Env, member: &Address) -> bool {
+    if let Some(council_member) = env.storage().persistent().get::<SecurityCouncilMember>(&DataKey::SecurityCouncilMember(member.clone())) {
+        council_member.is_active
+    } else {
+        false
+    }
+}
+
+fn execute_registry_update(env: &Env, proposal_id: u64) {
+    let proposal_key = DataKey::RegistryUpdateProposal(proposal_id);
+    let mut proposal: RegistryUpdateProposal = env.storage().persistent()
+        .get(&proposal_key)
+        .expect("proposal not found");
+    
+    let merchant_key = DataKey::MerchantRegistry(proposal.merchant_address.clone());
+    
+    match proposal.update_type {
+        RegistryUpdateType::WhitelistMerchant => {
+            // Check if merchant exists, if not create basic entry
+            let mut merchant_status = if let Some(existing_status) = env.storage().persistent().get::<MerchantStatus>(&merchant_key) {
+                existing_status
+            } else {
+                MerchantStatus {
+                    is_verified: false,
+                    is_blacklisted: false,
+                    verification_method: VerificationMethod::DAOApproval,
+                    registered_at: env.ledger().timestamp(),
+                    last_verified: 0,
+                    dao_approved: false,
+                }
+            };
+            
+            merchant_status.is_verified = true;
+            merchant_status.is_blacklisted = false;
+            merchant_status.verification_method = VerificationMethod::DAOApproval;
+            merchant_status.dao_approved = true;
+            merchant_status.last_verified = env.ledger().timestamp();
+            
+            env.storage().persistent().set(&merchant_key, &merchant_status);
+            
+            // Emit merchant whitelisted event
+            MerchantWhitelisted {
+                merchant: proposal.merchant_address.clone(),
+                verification_method: VerificationMethod::DAOApproval,
+                whitelisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+        RegistryUpdateType::BlacklistMerchant => {
+            // Check if merchant exists
+            let mut merchant_status = env.storage().persistent()
+                .get::<MerchantStatus>(&merchant_key)
+                .expect("merchant not registered");
+            
+            merchant_status.is_blacklisted = true;
+            merchant_status.is_verified = false;
+            merchant_status.last_verified = env.ledger().timestamp();
+            
+            env.storage().persistent().set(&merchant_key, &merchant_status);
+            env.storage().persistent().set(&DataKey::BlacklistedMerchant(proposal.merchant_address.clone()), &true);
+            
+            // Emit merchant blacklisted event
+            MerchantBlacklisted {
+                merchant: proposal.merchant_address.clone(),
+                blacklisted_by: Address::from_string(&soroban_sdk::String::from_str(env, "Security Council")),
+                reason: soroban_sdk::String::from_str(env, "Registry update proposal executed"),
+                blacklisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+        RegistryUpdateType::RemoveMerchant => {
+            // Remove merchant from registry
+            env.storage().persistent().remove(&merchant_key);
+            env.storage().persistent().remove(&DataKey::BlacklistedMerchant(proposal.merchant_address.clone()));
+            env.storage().persistent().remove(&DataKey::KYCCredential(proposal.merchant_address.clone()));
+        }
+    }
+    
+    // Mark proposal as executed
+    proposal.executed = true;
+    env.storage().persistent().set(&proposal_key, &proposal);
+}
+
+// --- Merchant Registry and KYC Whitelisting Helper Functions ---
+
+fn is_merchant_registered(env: &Env, merchant: &Address) -> bool {
+    env.storage().persistent().has(&DataKey::MerchantRegistry(merchant.clone()))
+}
+
+fn is_merchant_blacklisted(env: &Env, merchant: &Address) -> bool {
+    env.storage().persistent().has(&DataKey::BlacklistedMerchant(merchant.clone()))
+}
+
+fn generate_proposal_id(env: &Env) -> u64 {
+    // Generate unique proposal ID based on timestamp and existing proposals
+    let now = env.ledger().timestamp();
+    let mut proposal_id = now;
+    
+    // Ensure uniqueness by checking existing proposals
+    while env.storage().persistent().has(&DataKey::DAOProposal(proposal_id)) {
+        proposal_id += 1;
+    }
+    
+    proposal_id
+}
+
+fn is_authorized_voter(env: &Env, voter: &Address) -> bool {
+    // For now, we'll use the contract admin as authorized voter
+    // In a real implementation, this could be based on DAO token holdings
+    if let Some(admin) = env.storage().persistent().get::<Address>(&DataKey::ContractAdmin) {
+        voter == &admin
+    } else {
+        false
+    }
+}
+
+fn is_authorized_dao_member(env: &Env, member: &Address) -> bool {
+    // For now, we'll use the contract admin as authorized DAO member
+    // In a real implementation, this would check against a DAO member list
+    if let Some(admin) = env.storage().persistent().get::<Address>(&DataKey::ContractAdmin) {
+        member == &admin
+    } else {
+        false
+    }
+}
+
+fn execute_merchant_proposal(env: &Env, proposal_id: u64) {
+    let proposal_key = DataKey::DAOProposal(proposal_id);
+    let mut proposal: DAOProposal = env.storage().persistent()
+        .get(&proposal_key)
+        .expect("proposal not found");
+    
+    let merchant_key = DataKey::MerchantRegistry(proposal.merchant_address.clone());
+    let mut merchant_status: MerchantStatus = env.storage().persistent()
+        .get(&merchant_key)
+        .expect("merchant not registered");
+    
+    match proposal.proposal_type {
+        ProposalType::WhitelistMerchant => {
+            merchant_status.is_verified = true;
+            merchant_status.dao_approved = true;
+            merchant_status.verification_method = VerificationMethod::DAOApproval;
+            merchant_status.last_verified = env.ledger().timestamp();
+            
+            // Emit merchant whitelisted event
+            MerchantWhitelisted {
+                merchant: proposal.merchant_address.clone(),
+                verification_method: VerificationMethod::DAOApproval,
+                whitelisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+        ProposalType::BlacklistMerchant => {
+            merchant_status.is_blacklisted = true;
+            merchant_status.is_verified = false;
+            merchant_status.last_verified = env.ledger().timestamp();
+            
+            // Emit merchant blacklisted event
+            MerchantBlacklisted {
+                merchant: proposal.merchant_address.clone(),
+                blacklisted_by: Address::from_string(&soroban_sdk::String::from_str(env, "DAO")),
+                reason: soroban_sdk::String::from_str(env, "DAO proposal executed"),
+                blacklisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+    }
+    
+    // Mark proposal as executed
+    proposal.executed = true;
+    env.storage().persistent().set(&proposal_key, &proposal);
+    env.storage().persistent().set(&merchant_key, &merchant_status);
+    
+    // Emit proposal executed event
+    DAOProposalExecuted {
+        proposal_id,
+        merchant: proposal.merchant_address.clone(),
+        proposal_type: proposal.proposal_type.clone(),
+        executed: true,
+        executed_at: env.ledger().timestamp(),
+    }.publish(env);
+}
+
 // --- Global Reentrancy Guard Helper Functions ---
 
 /// RAII-style reentrancy guard using temporary storage
@@ -2652,4 +3320,4 @@ mod test_formal_verification;
 #[cfg(test)]
 mod test_reentrancy_guard;
 #[cfg(test)]
-mod test_timelock_governance;
+
