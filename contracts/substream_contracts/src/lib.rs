@@ -82,9 +82,10 @@ pub enum DataKey {
     CommunityGoal(Address),            // Target flow rate for "Bonus Video"
     UserReferrer(Address),
     ReferralTracker(Address, Address),
-    CurrentFlowRate(Address),   // Aggregated flow rate for a channel
-    AcceptedToken(Address),     // Issue #49: Creator's enforced stablecoin token
-    DaoGrant(Address, Address), // (dao, creator) — DAO treasury grant stream
+    CurrentFlowRate(Address),          // Aggregated flow rate for a channel
+    AcceptedToken(Address),            // Issue #49: Creator's enforced stablecoin token
+    DaoGrant(Address, Address),        // (dao, creator) — DAO treasury grant stream
+    UserContributed(Address, Address), // (fan, creator) — lifetime tokens contributed by fan
 }
 
 #[contracttype]
@@ -283,6 +284,16 @@ pub struct GrantRevoked {
     pub refund_amount: i128,
 }
 
+#[contractevent]
+pub struct CliffUnlocked {
+    #[topic]
+    pub fan: Address,
+    #[topic]
+    pub creator: Address,
+    pub total_contributed: i128,
+    pub cliff_threshold: i128,
+}
+
 #[contract]
 pub struct SubStreamContract;
 
@@ -471,6 +482,7 @@ impl SubStreamContract {
         }
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&user, &creator, &amount);
+        credit_fan_contribution(&env, &user, &creator, amount);
         TipReceived {
             user,
             creator,
@@ -625,6 +637,50 @@ impl SubStreamContract {
     }
 
     // -----------------------------------------------------------------------
+    // Cliff-Based Access — Milestone Rewards for Early Supporters
+    // -----------------------------------------------------------------------
+
+    /// Creator sets the lifetime-contribution threshold that unlocks premium content.
+    /// `threshold` is in whole token units (not nano).
+    pub fn set_cliff_threshold(env: Env, creator: Address, threshold: i128) {
+        creator.require_auth();
+        if threshold <= 0 {
+            panic!("threshold must be positive");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::CliffThreshold(creator), &threshold);
+    }
+
+    /// Returns `true` when the fan's lifetime contributions to this creator
+    /// meet or exceed the creator's configured cliff threshold.
+    /// Returns `false` if no threshold is set (feature not enabled by creator).
+    pub fn check_cliff_access(env: Env, fan: Address, creator: Address) -> bool {
+        let threshold: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CliffThreshold(creator.clone()))
+            .unwrap_or(0);
+        if threshold == 0 {
+            return false;
+        }
+        let contributed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserContributed(fan, creator))
+            .unwrap_or(0);
+        contributed >= threshold
+    }
+
+    /// Returns the fan's total lifetime token contributions to a creator.
+    pub fn get_total_contributed(env: Env, fan: Address, creator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserContributed(fan, creator))
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
     // DAO Treasury Streaming — Grant Support
     // -----------------------------------------------------------------------
 
@@ -720,6 +776,7 @@ impl SubStreamContract {
             let token_client = TokenClient::new(&env, &grant.token);
             token_client.transfer(&env.current_contract_address(), &creator, &actual_payout);
             credit_creator_earnings(&env, &creator, actual_payout);
+            credit_fan_contribution(&env, &grant.dao, &creator, actual_payout);
         }
 
         grant.balance -= (elapsed.saturating_mul(grant.rate_per_second)).min(grant.balance);
@@ -910,6 +967,37 @@ fn credit_creator_earnings(env: &Env, creator: &Address, amount: i128) {
     set_creator_stats(env, creator, &stats);
 }
 
+/// Increments the fan's lifetime contribution counter for a creator and emits
+/// a `CliffUnlocked` event the first time the threshold is crossed.
+fn credit_fan_contribution(env: &Env, fan: &Address, creator: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let key = DataKey::UserContributed(fan.clone(), creator.clone());
+    let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let next = prev.saturating_add(amount);
+    env.storage().persistent().set(&key, &next);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+
+    // Emit CliffUnlocked exactly once — when the fan crosses the threshold.
+    let threshold: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CliffThreshold(creator.clone()))
+        .unwrap_or(0);
+    if threshold > 0 && prev < threshold && next >= threshold {
+        CliffUnlocked {
+            fan: fan.clone(),
+            creator: creator.clone(),
+            total_contributed: next,
+            cliff_threshold: threshold,
+        }
+        .publish(env);
+    }
+}
+
 fn distribute_and_collect(
     env: &Env,
     beneficiary: &Address,
@@ -1017,6 +1105,7 @@ fn distribute_and_collect(
             remaining -= payout;
             if payout > 0 {
                 credit_creator_earnings(env, &creator, payout);
+                credit_fan_contribution(env, &sub.beneficiary, &creator, payout);
                 token_client.transfer(&env.current_contract_address(), &creator, &payout);
             }
         }
@@ -1281,6 +1370,8 @@ fn pay_referral_rebate(
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_cliff_access;
 #[cfg(test)]
 mod test_dao_treasury;
 #[cfg(test)]
