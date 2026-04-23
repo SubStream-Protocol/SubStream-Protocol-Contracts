@@ -17,6 +17,11 @@ const REFERRAL_REBATE_BPS: i128 = 100; // 1% rebate
 const TTL_THRESHOLD: u32 = 17280; // Assuming ~1 day in ledgers for example
 const TTL_BUMP_AMOUNT: u32 = 518400; // Assuming ~30 days in ledgers for example
 
+// --- SLA Circuit Breaker Constants ---
+const SLA_THRESHOLD_BPS: u32 = 9990; // 99.9% uptime threshold (in basis points)
+const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
+const UPTIME_ORACLE_NONCE_TTL: u64 = 24 * 60 * 60; // 24 hour validity for oracle signatures
+
 // --- Helper: Charge Calculation ---
 fn calculate_discounted_charge(
     start_time: u64,
@@ -81,6 +86,8 @@ pub enum DataKey {
     ReferralTracker(Address, Address),
     CurrentFlowRate(Address),          // Aggregated flow rate for a channel
     AcceptedToken(Address),            // Issue #49: Creator's enforced stablecoin token
+    SLAStatus(Address),               // Creator's SLA status
+    UptimeOracleNonce(u64),           // Oracle nonce tracking
 }
 
 #[contracttype]
@@ -135,6 +142,28 @@ pub struct ReferralInfo {
     pub referrer: Address,
     pub referral_count: u32,
     pub total_rebates_earned: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UptimeOraclePayload {
+    pub creator: Address,
+    pub uptime_percentage: u32, // In basis points (e.g., 9990 = 99.9%)
+    pub downtime_minutes: u64,
+    pub period_start: u64,
+    pub period_end: u64,
+    pub nonce: u64,
+    pub oracle_signature: soroban_sdk::Vec<u8>, // Signature from uptime oracle
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SLAStatus {
+    pub active: bool,
+    pub last_updated: u64,
+    pub cumulative_downtime_minutes: u64,
+    pub current_penalty_period_start: u64,
+    pub total_refund_owed: i128,
 }
 
 // --- Events ---
@@ -236,6 +265,16 @@ pub struct UserBlacklisted {
 pub struct UserUnblacklisted {
     #[topic] pub creator: Address,
     #[topic] pub user: Address,
+}
+
+#[contractevent]
+pub struct SLABreached {
+    #[topic] pub creator: Address,
+    #[topic] pub subscriber: Address,
+    pub uptime_percentage: u32,
+    pub downtime_minutes: u64,
+    pub refund_amount: i128,
+    pub penalty_active: bool,
 }
 
 
@@ -560,12 +599,90 @@ impl SubStreamContract {
         env.storage().persistent().set(&DataKey::AcceptedToken(creator.clone()), &token);
         AcceptedTokenSet { creator, token }.publish(&env);
     }
-}
 
-// --- Internal Logic & Helpers ---
-
-fn bump_instance_ttl(env: &Env) {
-    env.storage().instance().bump(TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+    // --- SLA Circuit Breaker Methods ---
+    
+    /// Update SLA status based on uptime oracle payload
+    /// This method is called by the uptime oracle to report service availability
+    pub fn update_sla_status(env: Env, payload: UptimeOraclePayload) {
+        let now = env.ledger().timestamp();
+        
+        // Validate oracle nonce to prevent replay attacks
+        if env.storage().persistent().has(&DataKey::UptimeOracleNonce(payload.nonce)) {
+            panic!("oracle nonce already used");
+        }
+        
+        // Check nonce expiration (24 hour validity)
+        if payload.period_end + UPTIME_ORACLE_NONCE_TTL < now {
+            panic!("oracle signature expired");
+        }
+        
+        // Mark nonce as used
+        env.storage().persistent().set(&DataKey::UptimeOracleNonce(payload.nonce), &now);
+        
+        // Get or create SLA status for this creator
+        let mut sla_status = get_sla_status(&env, &payload.creator);
+        
+        // Check if SLA threshold is breached
+        if payload.uptime_percentage < SLA_THRESHOLD_BPS {
+            if !sla_status.active {
+                // SLA breach just started
+                sla_status.active = true;
+                sla_status.current_penalty_period_start = payload.period_start;
+            }
+            
+            // Update cumulative downtime
+            sla_status.cumulative_downtime_minutes += payload.downtime_minutes;
+            
+            // Calculate refund amount based on downtime
+            let refund_amount = calculate_sla_refund(&env, &payload.creator, payload.downtime_minutes);
+            sla_status.total_refund_owed += refund_amount;
+            
+            // Emit SLA breach event for all affected subscribers
+            emit_sla_breach_events(&env, &payload.creator, payload.uptime_percentage, payload.downtime_minutes, refund_amount, true);
+        } else {
+            if sla_status.active {
+                // SLA breach recovered
+                sla_status.active = false;
+                emit_sla_breach_events(&env, &payload.creator, payload.uptime_percentage, 0, 0, false);
+            }
+        }
+        
+        sla_status.last_updated = now;
+        set_sla_status(&env, &payload.creator, &sla_status);
+    }
+    
+    /// Get current SLA status for a creator
+    pub fn get_sla_status(env: Env, creator: Address) -> SLAStatus {
+        get_sla_status(&env, &creator)
+    }
+    
+    /// Allow subscriber to cancel with immediate refund if SLA breach exceeds 7 days
+    pub fn emergency_cancel_due_to_sla(env: Env, subscriber: Address, creator: Address) {
+        let sla_status = get_sla_status(&env, &creator);
+        
+        // Check if downtime exceeds 7 days (7 * 24 * 60 = 10080 minutes)
+        if sla_status.cumulative_downtime_minutes < 10080 {
+            panic!("SLA emergency cancellation only available after 7+ days of downtime");
+        }
+        
+        if !sla_status.active {
+            panic!("SLA emergency cancellation only available during active breach");
+        }
+        
+        // Perform immediate cancellation with full refund
+        cancel_internal(&env, &subscriber, &creator);
+        
+        // Return any remaining balance to subscriber
+        let key = subscription_key(&subscriber, &creator);
+        let sub = get_subscription(&env, &key);
+        
+        if sub.balance > 0 {
+            let refund_amount = sub.balance / PRECISION_MULTIPLIER;
+            let token_client = TokenClient::new(&env, &sub.token);
+            token_client.transfer(&env.current_contract_address(), &sub.payer, &refund_amount);
+        }
+    }
 }
 
 fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
@@ -1030,9 +1147,80 @@ fn pay_referral_rebate(
     }
 }
 
+// --- SLA Circuit Breaker Helper Functions ---
+
+fn get_sla_status(env: &Env, creator: &Address) -> SLAStatus {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SLAStatus(creator.clone()))
+        .unwrap_or(SLAStatus {
+            active: false,
+            last_updated: 0,
+            cumulative_downtime_minutes: 0,
+            current_penalty_period_start: 0,
+            total_refund_owed: 0,
+        })
+}
+
+fn set_sla_status(env: &Env, creator: &Address, status: &SLAStatus) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::SLAStatus(creator.clone()), status);
+}
+
+fn calculate_sla_refund(env: &Env, creator: &Address, downtime_minutes: u64) -> i128 {
+    // Calculate refund based on downtime: 1 minute of downtime = 1 minute of service cost
+    // Get the average rate for this creator across all active subscriptions
+    let total_rate_per_second = get_total_rate_for_creator(env, creator);
+    
+    // Convert downtime minutes to seconds
+    let downtime_seconds = downtime_minutes * 60;
+    
+    // Calculate refund amount in internal precision units
+    let refund_nano = total_rate_per_second * downtime_seconds as i128;
+    
+    // Convert to tokens (divide by precision multiplier)
+    refund_nano / PRECISION_MULTIPLIER
+}
+
+fn get_total_rate_for_creator(env: &Env, creator: &Address) -> i128 {
+    // This would typically iterate through all subscriptions for a creator
+    // For now, we'll use a simplified approach by checking the current flow rate
+    env.storage()
+        .persistent()
+        .get(&DataKey::CurrentFlowRate(creator.clone()))
+        .unwrap_or(0)
+}
+
+fn emit_sla_breach_events(
+    env: &Env,
+    creator: &Address,
+    uptime_percentage: u32,
+    downtime_minutes: u64,
+    refund_amount: i128,
+    penalty_active: bool,
+) {
+    // In a real implementation, this would find all active subscribers for this creator
+    // For now, we emit a generic event. In practice, you might want to:
+    // 1. Iterate through all subscriptions for this creator
+    // 2. Emit individual events for each subscriber
+    
+    SLABreached {
+        creator: creator.clone(),
+        subscriber: creator.clone(), // Placeholder - in practice would be actual subscriber
+        uptime_percentage,
+        downtime_minutes,
+        refund_amount,
+        penalty_active,
+    }
+    .publish(env);
+}
+
 #[cfg(test)]
 mod test;
 #[cfg(test)]
 mod test_tiny_streams;
 #[cfg(test)]
 mod test_withdrawal_consistency;
+#[cfg(test)]
+mod test_sla_circuit_breaker;
