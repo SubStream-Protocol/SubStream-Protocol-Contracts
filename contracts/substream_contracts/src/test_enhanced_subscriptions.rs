@@ -16,6 +16,31 @@ fn create_token_contract<'a>(env: &Env, admin: &Address) -> token::Client<'a> {
     token::Client::new(env, &sac.address())
 }
 
+fn setup_merchant_registry<'a>(
+    env: &Env,
+    client: &SubStreamContractClient<'a>,
+    admin: &Address,
+    merchant: &Address,
+    token: &token::Client<'a>,
+) {
+    client.initialize(admin);
+    let kyc_hash = vec![env; 32u8];
+    let issuer = Address::from_string(&soroban_sdk::String::from_str(env, crate::SEP12_KYC_ISSUER));
+    client.register_merchant_with_kyc(merchant, &kyc_hash, &issuer);
+    client.set_accepted_token(merchant, &token.address());
+}
+
+fn approve_for_contract<'a>(
+    env: &Env,
+    token_admin: &token::StellarAssetClient<'a>,
+    subscriber: &Address,
+    contract_id: &Address,
+    amount: i128,
+) {
+    let exp = env.ledger().sequence() + 1_000_000u32;
+    token_admin.approve(subscriber, contract_id, &amount, &exp);
+}
+
 // ---------------------------------------------------------------------------
 // #101: Automated Pull-Payment Execution Module Tests
 // ---------------------------------------------------------------------------
@@ -36,7 +61,8 @@ fn test_execute_subscription_pull_success() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
-    // Register a plan
+    setup_merchant_registry(&env, &client, &admin, &merchant, &token);
+
     let plan = Plan {
         plan_id: 1,
         name: soroban_sdk::String::from_str(&env, "Basic Plan"),
@@ -48,22 +74,17 @@ fn test_execute_subscription_pull_success() {
     };
     client.register_plan(&merchant, plan);
 
-    // Initialize subscription
     env.ledger().set_timestamp(1000);
-    client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 
-    // Set up allowance
-    token_client.approve(&subscriber, &contract_id, &1000);
+    approve_for_contract(&env, &token_admin, &subscriber, &contract_id, 1000);
 
-    // Jump to billing date
     env.ledger().set_timestamp(1000 + MONTH);
 
-    // Execute pull payment
-    client.execute_subscription_pull(&merchant, &subscriber);
+    client.execute_subscription_pull(&merchant, &subscriber, &0i128, &None);
 
-    // Verify events
     let events = env.events().all();
-    assert_eq!(events.len(), 2); // Subscribed + SubscriptionBilled
+    assert_eq!(events.len(), 2);
 }
 
 #[test]
@@ -80,6 +101,8 @@ fn test_execute_subscription_pull_premature() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    setup_merchant_registry(&env, &client, &admin, &merchant, &token);
+
     let plan = Plan {
         plan_id: 1,
         name: soroban_sdk::String::from_str(&env, "Basic Plan"),
@@ -92,15 +115,13 @@ fn test_execute_subscription_pull_premature() {
     client.register_plan(&merchant, plan);
 
     env.ledger().set_timestamp(1000);
-    client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 
-    // Try to pull before billing date
     env.ledger().set_timestamp(1000 + DAY);
-    client.execute_subscription_pull(&merchant, &subscriber);
+    client.execute_subscription_pull(&merchant, &subscriber, &0i128, &None);
 }
 
 #[test]
-#[should_panic(expected = "insufficient allowance")]
 fn test_execute_subscription_pull_insufficient_allowance() {
     let env = Env::default();
     env.mock_all_auths();
@@ -113,6 +134,8 @@ fn test_execute_subscription_pull_insufficient_allowance() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    setup_merchant_registry(&env, &client, &admin, &merchant, &token);
+
     let plan = Plan {
         plan_id: 1,
         name: soroban_sdk::String::from_str(&env, "Basic Plan"),
@@ -125,11 +148,15 @@ fn test_execute_subscription_pull_insufficient_allowance() {
     client.register_plan(&merchant, plan);
 
     env.ledger().set_timestamp(1000);
-    client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 
-    // Don't set up allowance
     env.ledger().set_timestamp(1000 + MONTH);
-    client.execute_subscription_pull(&merchant, &subscriber);
+    client.execute_subscription_pull(&merchant, &subscriber, &0i128, &None);
+
+    assert_eq!(
+        client.get_subscription_status(&subscriber, &merchant),
+        SubscriptionStatus::PastDue
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +176,8 @@ fn test_trial_period_auto_conversion() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
-    // Register a trial plan
+    setup_merchant_registry(&env, &client, &admin, &merchant, &token);
+
     let plan = Plan {
         plan_id: 1,
         name: soroban_sdk::String::from_str(&env, "Trial Plan"),
@@ -161,32 +189,26 @@ fn test_trial_period_auto_conversion() {
     };
     client.register_plan(&merchant, plan);
 
-    // Initialize subscription with trial
     env.ledger().set_timestamp(1000);
-    client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 
-    // Verify trial status
     assert_eq!(
         client.get_subscription_status(&subscriber, &merchant),
         SubscriptionStatus::Trial
     );
 
-    // Set up allowance for after trial
-    token_client.approve(&subscriber, &contract_id, &1000);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address());
+    approve_for_contract(&env, &token_admin, &subscriber, &contract_id, 1000);
 
-    // Jump past trial period
     env.ledger().set_timestamp(1000 + 7 * DAY + 1);
 
-    // Execute first pull payment (should convert from trial)
-    client.execute_subscription_pull(&merchant, &subscriber);
+    client.execute_subscription_pull(&merchant, &subscriber, &0i128, &None);
 
-    // Verify converted to active
     assert_eq!(
         client.get_subscription_status(&subscriber, &merchant),
         SubscriptionStatus::Active
     );
 
-    // Verify trial events
     let events = env.events().all();
     assert!(events.iter().any(|e| {
         matches!(e.topic_0, Some(topic) if topic == Symbol::from_str(&env, "TrialStarted"))
@@ -207,6 +229,8 @@ fn test_trial_abuse_prevention() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    setup_merchant_registry(&env, &client, &admin, &merchant, &token);
+
     let plan = Plan {
         plan_id: 1,
         name: soroban_sdk::String::from_str(&env, "Trial Plan"),
@@ -218,15 +242,12 @@ fn test_trial_abuse_prevention() {
     };
     client.register_plan(&merchant, plan);
 
-    // First trial
     env.ledger().set_timestamp(1000);
-    client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 
-    // Cancel subscription
     client.cancel(&subscriber, &merchant);
 
-    // Try to start another trial with same merchant
-    client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +267,8 @@ fn test_grace_period_entry_and_recovery() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    setup_merchant_registry(&env, &client, &admin, &merchant, &token);
+
     let plan = Plan {
         plan_id: 1,
         name: soroban_sdk::String::from_str(&env, "Basic Plan"),
@@ -258,36 +281,27 @@ fn test_grace_period_entry_and_recovery() {
     client.register_plan(&merchant, plan);
 
     env.ledger().set_timestamp(1000);
-    client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 
-    // Jump to billing date but don't provide allowance
     env.ledger().set_timestamp(1000 + MONTH);
 
-    // Try to pull - should fail and enter grace period
-    let result = std::panic::catch_unwind(|| {
-        client.execute_subscription_pull(&merchant, &subscriber);
-    });
-    assert!(result.is_err());
+    client.execute_subscription_pull(&merchant, &subscriber, &0i128, &None);
 
-    // Verify in grace period
     assert_eq!(
         client.get_subscription_status(&subscriber, &merchant),
         SubscriptionStatus::PastDue
     );
 
-    // Verify grace period started event
     let events = env.events().all();
     assert!(events.iter().any(|e| {
         matches!(e.topic_0, Some(topic) if topic == Symbol::from_str(&env, "PaymentFailedGracePeriodStarted"))
     }));
 
-    // Now provide allowance and recover
-    token_client.approve(&subscriber, &contract_id, &1000);
-    
-    // Should succeed within grace period
-    client.execute_subscription_pull(&merchant, &subscriber);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address());
+    approve_for_contract(&env, &token_admin, &subscriber, &contract_id, 1000);
 
-    // Verify back to active
+    client.execute_subscription_pull(&merchant, &subscriber, &0i128, &None);
+
     assert_eq!(
         client.get_subscription_status(&subscriber, &merchant),
         SubscriptionStatus::Active
@@ -308,6 +322,8 @@ fn test_grace_period_expiration() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    setup_merchant_registry(&env, &client, &admin, &merchant, &token);
+
     let plan = Plan {
         plan_id: 1,
         name: soroban_sdk::String::from_str(&env, "Basic Plan"),
@@ -320,19 +336,14 @@ fn test_grace_period_expiration() {
     client.register_plan(&merchant, plan);
 
     env.ledger().set_timestamp(1000);
-    client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 
-    // Jump to billing date and fail payment
     env.ledger().set_timestamp(1000 + MONTH);
-    let _ = std::panic::catch_unwind(|| {
-        client.execute_subscription_pull(&merchant, &subscriber);
-    });
+    client.execute_subscription_pull(&merchant, &subscriber, &0i128, &None);
 
-    // Jump past grace period (7 days)
     env.ledger().set_timestamp(1000 + MONTH + 7 * DAY + 1);
 
-    // Try to pull - should fail due to expired grace period
-    client.execute_subscription_pull(&merchant, &subscriber);
+    client.execute_subscription_pull(&merchant, &subscriber, &0i128, &None);
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +366,8 @@ fn test_subscription_upgrade_with_proration() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
-    // Register basic plan
+    setup_merchant_registry(&env, &client, &admin, &merchant, &token);
+
     let basic_plan = Plan {
         plan_id: 1,
         name: soroban_sdk::String::from_str(&env, "Basic Plan"),
@@ -367,7 +379,6 @@ fn test_subscription_upgrade_with_proration() {
     };
     client.register_plan(&merchant, basic_plan);
 
-    // Register pro plan
     let pro_plan = Plan {
         plan_id: 2,
         name: soroban_sdk::String::from_str(&env, "Pro Plan"),
@@ -379,23 +390,18 @@ fn test_subscription_upgrade_with_proration() {
     };
     client.register_plan(&merchant, pro_plan);
 
-    // Start with basic plan
     env.ledger().set_timestamp(1000);
-    client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 
-    // Jump halfway through billing cycle
     env.ledger().set_timestamp(1000 + MONTH / 2);
 
-    // Upgrade to pro plan
     client.upgrade_subscription_tier(&subscriber, &merchant, &2);
 
-    // Verify upgrade event
     let events = env.events().all();
     assert!(events.iter().any(|e| {
         matches!(e.topic_0, Some(topic) if topic == Symbol::from_str(&env, "SubscriptionUpgraded"))
     }));
 
-    // Verify new billing amount
     let billing_key = DataKey::BillingCycle(subscriber.clone(), merchant.clone());
     let billing_info: BillingCycleInfo = env.storage().persistent().get(&billing_key).unwrap();
     assert_eq!(billing_info.billing_amount, 200);
@@ -415,7 +421,8 @@ fn test_prevent_downgrade() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
-    // Register pro plan
+    setup_merchant_registry(&env, &client, &admin, &merchant, &token);
+
     let pro_plan = Plan {
         plan_id: 2,
         name: soroban_sdk::String::from_str(&env, "Pro Plan"),
@@ -427,7 +434,6 @@ fn test_prevent_downgrade() {
     };
     client.register_plan(&merchant, pro_plan);
 
-    // Register basic plan
     let basic_plan = Plan {
         plan_id: 1,
         name: soroban_sdk::String::from_str(&env, "Basic Plan"),
@@ -439,11 +445,9 @@ fn test_prevent_downgrade() {
     };
     client.register_plan(&merchant, basic_plan);
 
-    // Start with pro plan
     env.ledger().set_timestamp(1000);
-    client.initialize_subscription(&subscriber, &merchant, &2, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &2, &token.address(), &None);
 
-    // Try to downgrade to basic plan
     client.upgrade_subscription_tier(&subscriber, &merchant, &1);
 }
 
@@ -467,7 +471,8 @@ fn test_full_subscription_lifecycle() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
-    // Register trial and paid plans
+    setup_merchant_registry(&env, &client, &admin, &merchant, &token);
+
     let trial_plan = Plan {
         plan_id: 1,
         name: soroban_sdk::String::from_str(&env, "Trial Plan"),
@@ -490,37 +495,30 @@ fn test_full_subscription_lifecycle() {
     };
     client.register_plan(&merchant, pro_plan);
 
-    // Start trial
     env.ledger().set_timestamp(1000);
-    client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 
-    // Verify trial status
     assert_eq!(
         client.get_subscription_status(&subscriber, &merchant),
         SubscriptionStatus::Trial
     );
 
-    // Set up allowance for post-trial billing
-    token_client.approve(&subscriber, &contract_id, &1000);
+    approve_for_contract(&env, &token_admin, &subscriber, &contract_id, 1000);
 
-    // Jump past trial and upgrade to pro
     env.ledger().set_timestamp(1000 + 7 * DAY + 1);
     client.upgrade_subscription_tier(&subscriber, &merchant, &2);
 
-    // Execute first billing
-    client.execute_subscription_pull(&merchant, &subscriber);
+    client.execute_subscription_pull(&merchant, &subscriber, &0i128, &None);
 
-    // Verify active status
     assert_eq!(
         client.get_subscription_status(&subscriber, &merchant),
         SubscriptionStatus::Active
     );
 
-    // Continue with normal billing cycles
     for i in 1..=3 {
         env.ledger().set_timestamp(1000 + 7 * DAY + 1 + (i as u64 * MONTH));
-        client.execute_subscription_pull(&merchant, &subscriber);
-        
+        client.execute_subscription_pull(&merchant, &subscriber, &0i128, &None);
+
         assert_eq!(
             client.get_subscription_status(&subscriber, &merchant),
             SubscriptionStatus::Active
@@ -544,11 +542,12 @@ fn test_proration_math_edge_cases() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
-    // Test with very small amounts to check rounding
+    setup_merchant_registry(&env, &client, &admin, &merchant, &token);
+
     let basic_plan = Plan {
         plan_id: 1,
         name: soroban_sdk::String::from_str(&env, "Basic Plan"),
-        billing_amount: 1, // 1 token
+        billing_amount: 1,
         billing_cycle: MONTH,
         has_trial: false,
         trial_duration: 0,
@@ -559,7 +558,7 @@ fn test_proration_math_edge_cases() {
     let premium_plan = Plan {
         plan_id: 2,
         name: soroban_sdk::String::from_str(&env, "Premium Plan"),
-        billing_amount: 3, // 3 tokens
+        billing_amount: 3,
         billing_cycle: MONTH,
         has_trial: false,
         trial_duration: 0,
@@ -567,15 +566,12 @@ fn test_proration_math_edge_cases() {
     };
     client.register_plan(&merchant, premium_plan);
 
-    // Start with basic plan
     env.ledger().set_timestamp(1000);
-    client.initialize_subscription(&subscriber, &merchant, &1, &token.address());
+    client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 
-    // Upgrade very late in cycle (should charge full difference)
     env.ledger().set_timestamp(1000 + MONTH - 1);
     client.upgrade_subscription_tier(&subscriber, &merchant, &2);
 
-    // Verify upgrade completed successfully
     assert_eq!(
         client.get_subscription_status(&subscriber, &merchant),
         SubscriptionStatus::Active
