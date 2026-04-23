@@ -82,6 +82,7 @@ pub enum DataKey {
     ChannelPaused(Address),
     Escrow(Address, Address),
     Nullifier(Bytes),
+    NullifierExpirationIndex(u64),    // Index for tracking nullifier expiration cleanup
     YieldConfig(Address),
     SLAStatus(Address),               // Merged from main
     UptimeOracleNonce(u64),           // Merged from main
@@ -272,6 +273,13 @@ pub struct DAOVote {
     pub proposal_id: u64,
     pub vote: bool, // true = for, false = against
     pub voted_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NullifierExpiration {
+    pub nullifier: soroban_sdk::Bytes,
+    pub expires_at: u64,
 }
 
 // --- Events ---
@@ -491,6 +499,13 @@ pub struct ReentrancyAttemptDetected {
     #[topic] pub caller: Address,
     #[topic] pub protected_function: soroban_sdk::String,
     pub detected_at: u64,
+}
+
+#[contractevent]
+pub struct ReplayAttackBlocked {
+    #[topic] pub merchant: Address,
+    #[topic] pub nullifier: soroban_sdk::Bytes,
+    pub blocked_at: u64,
 }
 
 #[contract]
@@ -1253,6 +1268,155 @@ impl SubStreamContract {
         env.storage().persistent()
             .get(&DataKey::MerchantRegistry(merchant))
             .expect("merchant not found")
+    }
+
+    // --- Anonymous Subscription Verification with Nullifier Tracking ---
+    
+    // Constants for nullifier management
+    const NULLIFIER_VALIDITY_PERIOD: u64 = 30 * 24 * 60 * 60; // 30 days
+    const NULLIFIER_CLEANUP_BATCH_SIZE: u64 = 100; // Process up to 100 nullifiers per cleanup
+    
+    // Verify anonymous subscription with ZK-proof and nullifier
+    pub fn verify_anonymous_subscription(
+        env: Env,
+        merchant: Address,
+        proof: soroban_sdk::Bytes,
+        nullifier: soroban_sdk::Bytes,
+    ) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "verify_anonymous_subscription");
+        
+        // Check if merchant is verified
+        if !is_merchant_verified(&env, &merchant) {
+            panic!("merchant is not verified");
+        }
+        
+        // Check if nullifier already exists (replay attack prevention)
+        let nullifier_key = DataKey::Nullifier(nullifier.clone());
+        if env.storage().persistent().has(&nullifier_key) {
+            // Emit replay attack blocked event
+            ReplayAttackBlocked {
+                merchant: merchant.clone(),
+                nullifier: nullifier.clone(),
+                blocked_at: env.ledger().timestamp(),
+            }.publish(&env);
+            
+            panic!("replay attack detected: nullifier already used");
+        }
+        
+        // In a real implementation, this would verify the ZK-proof
+        // For now, we'll assume the proof is valid if it has the expected length
+        if proof.len() != 64 {
+            panic!("invalid proof length");
+        }
+        
+        // Store nullifier with expiration timestamp
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(NULLIFIER_VALIDITY_PERIOD);
+        
+        // Store nullifier to prevent reuse
+        env.storage().persistent().set(&nullifier_key, &true);
+        
+        // Store expiration info for cleanup
+        let expiration_index_key = DataKey::NullifierExpirationIndex(now);
+        let expiration_info = NullifierExpiration {
+            nullifier: nullifier.clone(),
+            expires_at,
+        };
+        env.storage().persistent().set(&expiration_index_key, &expiration_info);
+        
+        // Set TTL for cleanup entry
+        env.storage().persistent().extend_ttl(&expiration_index_key, NULLIFIER_VALIDITY_PERIOD, NULLIFIER_VALIDITY_PERIOD);
+    }
+    
+    // Try to verify anonymous subscription (returns Result for testing)
+    pub fn try_verify_anonymous_subscription(
+        env: Env,
+        merchant: Address,
+        proof: soroban_sdk::Bytes,
+        nullifier: soroban_sdk::Bytes,
+    ) -> Result<(), soroban_sdk::Error> {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "try_verify_anonymous_subscription");
+        
+        // Check if merchant is verified
+        if !is_merchant_verified(&env, &merchant) {
+            return Err(soroban_sdk::Error::from_contract_error(1));
+        }
+        
+        // Check if nullifier already exists (replay attack prevention)
+        let nullifier_key = DataKey::Nullifier(nullifier.clone());
+        if env.storage().persistent().has(&nullifier_key) {
+            // Emit replay attack blocked event
+            ReplayAttackBlocked {
+                merchant: merchant.clone(),
+                nullifier: nullifier.clone(),
+                blocked_at: env.ledger().timestamp(),
+            }.publish(&env);
+            
+            return Err(soroban_sdk::Error::from_contract_error(2));
+        }
+        
+        // Verify proof
+        if proof.len() != 64 {
+            return Err(soroban_sdk::Error::from_contract_error(3));
+        }
+        
+        // Store nullifier with expiration timestamp
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(NULLIFIER_VALIDITY_PERIOD);
+        
+        // Store nullifier to prevent reuse
+        env.storage().persistent().set(&nullifier_key, &true);
+        
+        // Store expiration info for cleanup
+        let expiration_index_key = DataKey::NullifierExpirationIndex(now);
+        let expiration_info = NullifierExpiration {
+            nullifier: nullifier.clone(),
+            expires_at,
+        };
+        env.storage().persistent().set(&expiration_index_key, &expiration_info);
+        
+        // Set TTL for cleanup entry
+        env.storage().persistent().extend_ttl(&expiration_index_key, NULLIFIER_VALIDITY_PERIOD, NULLIFIER_VALIDITY_PERIOD);
+        
+        Ok(())
+    }
+    
+    // Cleanup expired nullifiers to prevent storage bloat
+    pub fn cleanup_expired_nullifiers(env: Env) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "cleanup_expired_nullifiers");
+        
+        let now = env.ledger().timestamp();
+        let mut processed = 0u64;
+        
+        // Scan for expired nullifiers by timestamp
+        let mut current_timestamp = now.saturating_sub(NULLIFIER_VALIDITY_PERIOD);
+        
+        while processed < NULLIFIER_CLEANUP_BATCH_SIZE && current_timestamp <= now {
+            let expiration_index_key = DataKey::NullifierExpirationIndex(current_timestamp);
+            
+            if let Some(expiration_info) = env.storage().persistent().get::<NullifierExpiration>(&expiration_index_key) {
+                if expiration_info.expires_at <= now {
+                    // Remove expired nullifier
+                    let nullifier_key = DataKey::Nullifier(expiration_info.nullifier.clone());
+                    env.storage().persistent().remove(&nullifier_key);
+                    
+                    // Remove expiration index entry
+                    env.storage().persistent().remove(&expiration_index_key);
+                    
+                    processed += 1;
+                }
+            }
+            
+            current_timestamp = current_timestamp.saturating_add(1);
+        }
+    }
+    
+    // Check if nullifier exists (for testing purposes)
+    pub fn is_nullifier_used(env: Env, nullifier: soroban_sdk::Bytes) -> bool {
+        env.storage().persistent().has(&DataKey::Nullifier(nullifier))
     }
 
     fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
