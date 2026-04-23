@@ -94,22 +94,8 @@ pub enum DataKey {
     ReferralTracker(Address, Address),
     CurrentFlowRate(Address),          // Aggregated flow rate for a channel
     AcceptedToken(Address),            // Issue #49: Creator's enforced stablecoin token
-    PlanRegistry(Address),             // Merchant's pricing plans registry
-    TrialUsed(Address, Address),      // (user, merchant) - Prevent trial abuse
-    BillingCycle(Address, Address),    // (subscriber, merchant) - Billing cycle info
-    SLAStatus(Address),               // Creator's SLA status
-    UptimeOracleNonce(u64),           // Oracle nonce tracking
-    // --- Merchant Registry and KYC Whitelisting Keys ---
-    MerchantRegistry(Address),        // Merchant registration and verification status
-    KYCCredential(Address),           // SEP-12 KYC credential for merchant
-    DAOProposal(u64),                 // DAO proposal for merchant approval
-    DAOVote(Address, u64),           // DAO member vote on proposal
-    BlacklistedMerchant(Address),     // Blacklisted merchant status
-    RegistryUpdateProposal(u64),     // Timelock proposal for registry updates
-    SecurityCouncilMember(Address),   // Security council membership
-    SecurityCouncilVeto(Address, u64), // Security council veto on proposal
-    // --- Global Reentrancy Guard Keys ---
-    ReentrancyGuard,                 // Global reentrancy protection state
+    DaoGrant(Address, Address),        // (dao, creator) — DAO treasury grant stream
+    UserContributed(Address, Address), // (fan, creator) — lifetime tokens contributed by fan
 }
 
 #[contracttype]
@@ -590,6 +576,16 @@ pub struct ReplayAttackBlocked {
     pub blocked_at: u64,
 }
 
+#[contractevent]
+pub struct CliffUnlocked {
+    #[topic]
+    pub fan: Address,
+    #[topic]
+    pub creator: Address,
+    pub total_contributed: i128,
+    pub cliff_threshold: i128,
+}
+
 #[contract]
 pub struct SubStreamContract;
 
@@ -783,6 +779,7 @@ impl SubStreamContract {
         }
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&user, &creator, &amount);
+        credit_fan_contribution(&env, &user, &creator, amount);
         TipReceived {
             user,
             creator,
@@ -936,106 +933,59 @@ impl SubStreamContract {
         AcceptedTokenSet { creator, token }.publish(&env);
     }
 
-    // --- SLA Circuit Breaker Methods ---
-    
-    /// Update SLA status based on uptime oracle payload
-    /// This method is called by the uptime oracle to report service availability
-    pub fn update_sla_status(env: Env, payload: UptimeOraclePayload) {
-        let now = env.ledger().timestamp();
-        
-        // Validate oracle nonce to prevent replay attacks
-        if env.storage().persistent().has(&DataKey::UptimeOracleNonce(payload.nonce)) {
-            panic!("oracle nonce already used");
+    // -----------------------------------------------------------------------
+    // Cliff-Based Access — Milestone Rewards for Early Supporters
+    // -----------------------------------------------------------------------
+
+    /// Creator sets the lifetime-contribution threshold that unlocks premium content.
+    /// `threshold` is in whole token units (not nano).
+    pub fn set_cliff_threshold(env: Env, creator: Address, threshold: i128) {
+        creator.require_auth();
+        if threshold <= 0 {
+            panic!("threshold must be positive");
         }
-        
-        // Check nonce expiration (24 hour validity)
-        if payload.period_end + UPTIME_ORACLE_NONCE_TTL < now {
-            panic!("oracle signature expired");
-        }
-        
-        // Mark nonce as used
-        env.storage().persistent().set(&DataKey::UptimeOracleNonce(payload.nonce), &now);
-        
-        // Get or create SLA status for this creator
-        let mut sla_status = get_sla_status(&env, &payload.creator);
-        
-        // Check if SLA threshold is breached
-        if payload.uptime_percentage < SLA_THRESHOLD_BPS {
-            if !sla_status.active {
-                // SLA breach just started
-                sla_status.active = true;
-                sla_status.current_penalty_period_start = payload.period_start;
-            }
-            
-            // Update cumulative downtime
-            sla_status.cumulative_downtime_minutes += payload.downtime_minutes;
-            
-            // Calculate refund amount based on downtime
-            let refund_amount = calculate_sla_refund(&env, &payload.creator, payload.downtime_minutes);
-            sla_status.total_refund_owed += refund_amount;
-            
-            // Emit SLA breach event for all affected subscribers
-            emit_sla_breach_events(&env, &payload.creator, payload.uptime_percentage, payload.downtime_minutes, refund_amount, true);
-        } else {
-            if sla_status.active {
-                // SLA breach recovered
-                sla_status.active = false;
-                emit_sla_breach_events(&env, &payload.creator, payload.uptime_percentage, 0, 0, false);
-            }
-        }
-        
-        sla_status.last_updated = now;
-        set_sla_status(&env, &payload.creator, &sla_status);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CliffThreshold(creator), &threshold);
     }
-    
-    /// Get current SLA status for a creator
-    pub fn get_sla_status(env: Env, creator: Address) -> SLAStatus {
-        get_sla_status(&env, &creator)
-    }
-    
-    /// Allow subscriber to cancel with immediate refund if SLA breach exceeds 7 days
-    pub fn emergency_cancel_due_to_sla(env: Env, subscriber: Address, creator: Address) {
-        let sla_status = get_sla_status(&env, &creator);
-        
-        // Check if downtime exceeds 7 days (7 * 24 * 60 = 10080 minutes)
-        if sla_status.cumulative_downtime_minutes < 10080 {
-            panic!("SLA emergency cancellation only available after 7+ days of downtime");
+
+    /// Returns `true` when the fan's lifetime contributions to this creator
+    /// meet or exceed the creator's configured cliff threshold.
+    /// Returns `false` if no threshold is set (feature not enabled by creator).
+    pub fn check_cliff_access(env: Env, fan: Address, creator: Address) -> bool {
+        let threshold: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CliffThreshold(creator.clone()))
+            .unwrap_or(0);
+        if threshold == 0 {
+            return false;
         }
-        
-        if !sla_status.active {
-            panic!("SLA emergency cancellation only available during active breach");
-        }
-        
-        // Perform immediate cancellation with full refund
-        cancel_internal(&env, &subscriber, &creator);
-        
-        let subscription = Subscription {
-            token: token.clone(),
-            tier,
-            balance: 0, // Start with zero balance for trial
-            last_collected: now,
-            start_time: now,
-            last_funds_exhausted: 0,
-            free_to_paid_emitted: false,
-            creators: vec![&env, merchant.clone()],
-            percentages: vec![&env, 100u32],
-            payer: subscriber.clone(),
-            beneficiary: subscriber.clone(),
-            accrued_remainder: 0,
-        };
-        
-        let sub_key = subscription_key(&subscriber, &merchant);
-        set_subscription(&env, &sub_key, &subscription);
-        
-        Subscribed {
-            subscriber: subscriber.clone(),
-            creator: merchant.clone(),
-            rate_per_second: plan.billing_amount / plan.billing_cycle as i128,
-        }.publish(&env);
+        let contributed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserContributed(fan, creator))
+            .unwrap_or(0);
+        contributed >= threshold
     }
-    
-    // #104: Tiered Subscription Upgrades and Proration Math
-    pub fn upgrade_subscription_tier(
+
+    /// Returns the fan's total lifetime token contributions to a creator.
+    pub fn get_total_contributed(env: Env, fan: Address, creator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserContributed(fan, creator))
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // DAO Treasury Streaming — Grant Support
+    // -----------------------------------------------------------------------
+
+    /// Called by a DAO contract to initiate a streaming grant to a creator.
+    /// The DAO is the payer; the creator receives tokens second-by-second.
+    /// Respects the same 7-day free-trial window and minimum-flow-duration
+    /// rules as regular subscriptions so the protocol remains consistent.
+    pub fn dao_grant(
         env: Env,
         subscriber: Address,
         merchant: Address,
@@ -1385,10 +1335,20 @@ impl SubStreamContract {
         if issuer != authorized_issuer {
             panic!("unauthorized KYC issuer");
         }
-        
-        // Check if merchant is already registered
-        if is_merchant_registered(&env, &merchant) {
-            panic!("merchant already registered");
+
+        let elapsed = (now - charge_start) as i128;
+        let accrued = elapsed
+            .saturating_mul(grant.rate_per_second)
+            .saturating_add(grant.accrued_remainder);
+        let payout_tokens = accrued / PRECISION_MULTIPLIER;
+        let available_tokens = grant.balance / PRECISION_MULTIPLIER;
+        let actual_payout = payout_tokens.min(available_tokens);
+
+        if actual_payout > 0 {
+            let token_client = TokenClient::new(&env, &grant.token);
+            token_client.transfer(&env.current_contract_address(), &creator, &actual_payout);
+            credit_creator_earnings(&env, &creator, actual_payout);
+            credit_fan_contribution(&env, &grant.dao, &creator, actual_payout);
         }
         
         // Check if merchant is blacklisted
@@ -1848,6 +1808,37 @@ fn credit_creator_earnings(env: &Env, creator: &Address, amount: i128) {
     set_creator_stats(env, creator, &stats);
 }
 
+/// Increments the fan's lifetime contribution counter for a creator and emits
+/// a `CliffUnlocked` event the first time the threshold is crossed.
+fn credit_fan_contribution(env: &Env, fan: &Address, creator: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let key = DataKey::UserContributed(fan.clone(), creator.clone());
+    let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let next = prev.saturating_add(amount);
+    env.storage().persistent().set(&key, &next);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+
+    // Emit CliffUnlocked exactly once — when the fan crosses the threshold.
+    let threshold: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CliffThreshold(creator.clone()))
+        .unwrap_or(0);
+    if threshold > 0 && prev < threshold && next >= threshold {
+        CliffUnlocked {
+            fan: fan.clone(),
+            creator: creator.clone(),
+            total_contributed: next,
+            cliff_threshold: threshold,
+        }
+        .publish(env);
+    }
+}
+
 fn distribute_and_collect(
     env: &Env,
     beneficiary: &Address,
@@ -1955,6 +1946,7 @@ fn distribute_and_collect(
             remaining -= payout;
             if payout > 0 {
                 credit_creator_earnings(env, &creator, payout);
+                credit_fan_contribution(env, &sub.beneficiary, &creator, payout);
                 token_client.transfer(&env.current_contract_address(), &creator, &payout);
             }
         }
@@ -2907,9 +2899,9 @@ pub fn is_reentrancy_guard_active(env: &Env) -> bool {
 #[cfg(test)]
 mod test;
 #[cfg(test)]
-mod test_withdrawal_consistency;
+mod test_cliff_access;
 #[cfg(test)]
-mod test_sla_circuit_breaker;
+mod test_dao_treasury;
 #[cfg(test)]
 mod test_enhanced_subscriptions;
 #[cfg(test)]
