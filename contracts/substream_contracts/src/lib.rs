@@ -25,7 +25,9 @@ const UPTIME_ORACLE_NONCE_TTL: u64 = 24 * 60 * 60; // 24 hour validity for oracl
 // --- Merchant Registry and KYC Whitelisting Constants ---
 const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
 const MERCHANT_KYC_VALIDITY: u64 = 365 * 24 * 60 * 60; // 1 year validity for KYC credentials
-const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
+const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
+const TIMELOCK_DURATION: u64 = 48 * 60 * 60; // 48-hour timelock for registry updates
+const SECURITY_COUNCIL_SIZE: u32 = 5; // 5-member security council for multi-sig
 
 // --- Helper: Charge Calculation ---
 fn calculate_discounted_charge(
@@ -100,6 +102,9 @@ pub enum DataKey {
     DAOProposal(u64),                 // DAO proposal for merchant approval
     DAOVote(Address, u64),           // DAO member vote on proposal
     BlacklistedMerchant(Address),     // Blacklisted merchant status
+    RegistryUpdateProposal(u64),     // Timelock proposal for registry updates
+    SecurityCouncilMember(Address),   // Security council membership
+    SecurityCouncilVeto(Address, u64), // Security council veto on proposal
     // --- Global Reentrancy Guard Keys ---
     ReentrancyGuard,                 // Global reentrancy protection state
 }
@@ -270,6 +275,46 @@ pub struct DAOVote {
     pub proposal_id: u64,
     pub vote: bool, // true = for, false = against
     pub voted_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryUpdateProposal {
+    pub proposal_id: u64,
+    pub merchant_address: Address,
+    pub update_type: RegistryUpdateType,
+    pub description: soroban_sdk::String,
+    pub proposed_at: u64,
+    pub executable_at: u64,          // When the proposal can be executed (48h later)
+    pub votes_for: soroban_sdk::Vec<Address>,
+    pub executed: bool,
+    pub canceled: bool,
+    pub emergency_bypass: bool,       // For severe scams requiring immediate action
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegistryUpdateType {
+    WhitelistMerchant,
+    BlacklistMerchant,
+    RemoveMerchant,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityCouncilMember {
+    pub member: Address,
+    pub added_at: u64,
+    pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityCouncilVeto {
+    pub council_member: Address,
+    pub proposal_id: u64,
+    pub veto_reason: soroban_sdk::String,
+    pub vetoed_at: u64,
 }
 
 #[contracttype]
@@ -479,6 +524,43 @@ pub struct DAOVoteCast {
     #[topic] pub proposal_id: u64,
     #[topic] pub vote: bool,
     pub voted_at: u64,
+}
+
+#[contractevent]
+pub struct RegistryUpdateProposed {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub merchant: Address,
+    #[topic] pub update_type: RegistryUpdateType,
+    pub proposed_by: Address,
+    pub executable_at: u64,
+    pub proposed_at: u64,
+    pub emergency_bypass: bool,
+}
+
+#[contractevent]
+pub struct RegistryUpdateExecuted {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub merchant: Address,
+    #[topic] pub update_type: RegistryUpdateType,
+    pub executed_by: Address,
+    pub executed_at: u64,
+}
+
+#[contractevent]
+pub struct RegistryUpdateCanceled {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub merchant: Address,
+    #[topic] pub canceled_by: Address,
+    pub canceled_at: u64,
+}
+
+#[contractevent]
+pub struct SecurityCouncilVetoed {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub council_member: Address,
+    #[topic] pub merchant: Address,
+    pub veto_reason: soroban_sdk::String,
+    pub vetoed_at: u64,
 }
 
 // --- Global Reentrancy Guard Events ---
@@ -1028,6 +1110,235 @@ impl SubStreamContract {
         }
     }
 
+    // --- Timelock and Multi-Sig Governance Functions ---
+    
+    /// Propose a registry update with mandatory 48-hour timelock
+    /// Requires 3-of-5 multi-sig consensus before execution
+    pub fn propose_registry_update(
+        env: Env,
+        proposer: Address,
+        merchant: Address,
+        update_type: RegistryUpdateType,
+        description: soroban_sdk::String,
+        emergency_bypass: bool,
+    ) -> u64 {
+        proposer.require_auth();
+        
+        // Verify proposer is authorized (Security Council member or admin)
+        if !is_authorized_proposer(&env, &proposer) {
+            panic!("unauthorized proposer");
+        }
+        
+        // Emergency bypass requires additional authorization
+        if emergency_bypass && !is_emergency_authorized(&env, &proposer) {
+            panic!("unauthorized emergency bypass");
+        }
+        
+        // Generate unique proposal ID
+        let proposal_id = generate_registry_proposal_id(&env);
+        
+        let now = env.ledger().timestamp();
+        let executable_at = if emergency_bypass {
+            now // Immediate execution for emergencies
+        } else {
+            now.saturating_add(TIMELOCK_DURATION) // 48-hour timelock
+        };
+        
+        let proposal = RegistryUpdateProposal {
+            proposal_id,
+            merchant_address: merchant.clone(),
+            update_type: update_type.clone(),
+            description: description.clone(),
+            proposed_at: now,
+            executable_at,
+            votes_for: vec![&env],
+            executed: false,
+            canceled: false,
+            emergency_bypass,
+        };
+        
+        env.storage().persistent().set(&DataKey::RegistryUpdateProposal(proposal_id), &proposal);
+        
+        // Emit event
+        RegistryUpdateProposed {
+            proposal_id,
+            merchant: merchant.clone(),
+            update_type,
+            proposed_by: proposer,
+            executable_at,
+            proposed_at: now,
+            emergency_bypass,
+        }.publish(&env);
+        
+        proposal_id
+    }
+    
+    /// Vote on a registry update proposal (3-of-5 multi-sig)
+    pub fn vote_registry_update(env: Env, voter: Address, proposal_id: u64) {
+        voter.require_auth();
+        
+        // Verify voter is Security Council member
+        if !is_security_council_member(&env, &voter) {
+            panic!("not a security council member");
+        }
+        
+        let proposal_key = DataKey::RegistryUpdateProposal(proposal_id);
+        let mut proposal: RegistryUpdateProposal = env.storage().persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+        
+        // Check if proposal is still pending
+        if proposal.executed || proposal.canceled {
+            panic!("proposal no longer active");
+        }
+        
+        // Check if already voted
+        if proposal.votes_for.contains(&voter) {
+            panic!("already voted");
+        }
+        
+        // Add vote
+        proposal.votes_for.push_back(voter.clone());
+        
+        // Update proposal
+        env.storage().persistent().set(&proposal_key, &proposal);
+        
+        // Check if consensus threshold is reached (3-of-5)
+        if proposal.votes_for.len() >= DAO_MULTISIG_THRESHOLD as usize {
+            // For non-emergency proposals, timelock must be respected
+            if !proposal.emergency_bypass {
+                let now = env.ledger().timestamp();
+                if now < proposal.executable_at {
+                    // Consensus reached but timelock not expired - proposal is ready for execution
+                    return;
+                }
+            }
+            
+            // Execute the proposal
+            execute_registry_update(&env, proposal_id);
+        }
+    }
+    
+    /// Execute a registry update proposal (after timelock expires)
+    pub fn execute_registry_update(env: Env, executor: Address, proposal_id: u64) {
+        executor.require_auth();
+        
+        let proposal_key = DataKey::RegistryUpdateProposal(proposal_id);
+        let proposal: RegistryUpdateProposal = env.storage().persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+        
+        // Verify proposal is ready for execution
+        if proposal.executed || proposal.canceled {
+            panic!("proposal no longer active");
+        }
+        
+        // Check timelock (unless emergency bypass)
+        if !proposal.emergency_bypass {
+            let now = env.ledger().timestamp();
+            if now < proposal.executable_at {
+                panic!("timelock not expired");
+            }
+        }
+        
+        // Check consensus threshold
+        if proposal.votes_for.len() < DAO_MULTISIG_THRESHOLD as usize {
+            panic!("consensus not reached");
+        }
+        
+        // Execute the registry update
+        execute_registry_update(&env, proposal_id);
+        
+        // Emit execution event
+        RegistryUpdateExecuted {
+            proposal_id,
+            merchant: proposal.merchant_address.clone(),
+            update_type: proposal.update_type.clone(),
+            executed_by: executor,
+            executed_at: env.ledger().timestamp(),
+        }.publish(&env);
+    }
+    
+    /// Security Council veto of pending proposal
+    pub fn security_council_veto(
+        env: Env,
+        council_member: Address,
+        proposal_id: u64,
+        veto_reason: soroban_sdk::String,
+    ) {
+        council_member.require_auth();
+        
+        // Verify council member authority
+        if !is_security_council_member(&env, &council_member) {
+            panic!("not a security council member");
+        }
+        
+        let proposal_key = DataKey::RegistryUpdateProposal(proposal_id);
+        let mut proposal: RegistryUpdateProposal = env.storage().persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+        
+        // Can only veto pending proposals
+        if proposal.executed || proposal.canceled {
+            panic!("cannot veto executed or canceled proposal");
+        }
+        
+        // Cancel the proposal
+        proposal.canceled = true;
+        env.storage().persistent().set(&proposal_key, &proposal);
+        
+        // Record veto
+        let veto = SecurityCouncilVeto {
+            council_member: council_member.clone(),
+            proposal_id,
+            veto_reason: veto_reason.clone(),
+            vetoed_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&DataKey::SecurityCouncilVeto(council_member.clone(), proposal_id), &veto);
+        
+        // Emit veto event
+        SecurityCouncilVetoed {
+            proposal_id,
+            council_member: council_member.clone(),
+            merchant: proposal.merchant_address.clone(),
+            veto_reason,
+            vetoed_at: env.ledger().timestamp(),
+        }.publish(&env);
+    }
+    
+    /// Initialize Security Council (5 members)
+    pub fn initialize_security_council(env: Env, admin: Address, council_members: soroban_sdk::Vec<Address>) {
+        admin.require_auth();
+        
+        // Verify admin authorization
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ContractAdmin)
+            .expect("not initialized");
+        if admin != stored_admin {
+            panic!("admin only");
+        }
+        
+        // Verify exactly 5 members
+        if council_members.len() != SECURITY_COUNCIL_SIZE as usize {
+            panic!("security council must have exactly 5 members");
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Add all council members
+        for i in 0..council_members.len() {
+            let member = council_members.get(i).unwrap();
+            let council_member = SecurityCouncilMember {
+                member: member.clone(),
+                added_at: now,
+                is_active: true,
+            };
+            env.storage().persistent().set(&DataKey::SecurityCouncilMember(member.clone()), &council_member);
+        }
+    }
+    
     // --- Merchant Registry and KYC Whitelisting Functions ---
 
     // Register a merchant with SEP-12 KYC verification
@@ -2262,6 +2573,124 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     env.storage().temporary().remove(&key);
 }
 
+// --- Timelock and Multi-Sig Governance Helper Functions ---
+
+fn generate_registry_proposal_id(env: &Env) -> u64 {
+    // Generate unique proposal ID based on timestamp and existing proposals
+    let now = env.ledger().timestamp();
+    let mut proposal_id = now;
+    
+    // Ensure uniqueness by checking existing proposals
+    while env.storage().persistent().has(&DataKey::RegistryUpdateProposal(proposal_id)) {
+        proposal_id += 1;
+    }
+    
+    proposal_id
+}
+
+fn is_authorized_proposer(env: &Env, proposer: &Address) -> bool {
+    // Security Council members and contract admin can propose
+    if is_security_council_member(env, proposer) {
+        return true;
+    }
+    
+    if let Some(admin) = env.storage().persistent().get::<Address>(&DataKey::ContractAdmin) {
+        proposer == &admin
+    } else {
+        false
+    }
+}
+
+fn is_emergency_authorized(env: &Env, proposer: &Address) -> bool {
+    // Emergency bypass requires admin authorization (higher security)
+    if let Some(admin) = env.storage().persistent().get::<Address>(&DataKey::ContractAdmin) {
+        proposer == &admin
+    } else {
+        false
+    }
+}
+
+fn is_security_council_member(env: &Env, member: &Address) -> bool {
+    if let Some(council_member) = env.storage().persistent().get::<SecurityCouncilMember>(&DataKey::SecurityCouncilMember(member.clone())) {
+        council_member.is_active
+    } else {
+        false
+    }
+}
+
+fn execute_registry_update(env: &Env, proposal_id: u64) {
+    let proposal_key = DataKey::RegistryUpdateProposal(proposal_id);
+    let mut proposal: RegistryUpdateProposal = env.storage().persistent()
+        .get(&proposal_key)
+        .expect("proposal not found");
+    
+    let merchant_key = DataKey::MerchantRegistry(proposal.merchant_address.clone());
+    
+    match proposal.update_type {
+        RegistryUpdateType::WhitelistMerchant => {
+            // Check if merchant exists, if not create basic entry
+            let mut merchant_status = if let Some(existing_status) = env.storage().persistent().get::<MerchantStatus>(&merchant_key) {
+                existing_status
+            } else {
+                MerchantStatus {
+                    is_verified: false,
+                    is_blacklisted: false,
+                    verification_method: VerificationMethod::DAOApproval,
+                    registered_at: env.ledger().timestamp(),
+                    last_verified: 0,
+                    dao_approved: false,
+                }
+            };
+            
+            merchant_status.is_verified = true;
+            merchant_status.is_blacklisted = false;
+            merchant_status.verification_method = VerificationMethod::DAOApproval;
+            merchant_status.dao_approved = true;
+            merchant_status.last_verified = env.ledger().timestamp();
+            
+            env.storage().persistent().set(&merchant_key, &merchant_status);
+            
+            // Emit merchant whitelisted event
+            MerchantWhitelisted {
+                merchant: proposal.merchant_address.clone(),
+                verification_method: VerificationMethod::DAOApproval,
+                whitelisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+        RegistryUpdateType::BlacklistMerchant => {
+            // Check if merchant exists
+            let mut merchant_status = env.storage().persistent()
+                .get::<MerchantStatus>(&merchant_key)
+                .expect("merchant not registered");
+            
+            merchant_status.is_blacklisted = true;
+            merchant_status.is_verified = false;
+            merchant_status.last_verified = env.ledger().timestamp();
+            
+            env.storage().persistent().set(&merchant_key, &merchant_status);
+            env.storage().persistent().set(&DataKey::BlacklistedMerchant(proposal.merchant_address.clone()), &true);
+            
+            // Emit merchant blacklisted event
+            MerchantBlacklisted {
+                merchant: proposal.merchant_address.clone(),
+                blacklisted_by: Address::from_string(&soroban_sdk::String::from_str(env, "Security Council")),
+                reason: soroban_sdk::String::from_str(env, "Registry update proposal executed"),
+                blacklisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+        RegistryUpdateType::RemoveMerchant => {
+            // Remove merchant from registry
+            env.storage().persistent().remove(&merchant_key);
+            env.storage().persistent().remove(&DataKey::BlacklistedMerchant(proposal.merchant_address.clone()));
+            env.storage().persistent().remove(&DataKey::KYCCredential(proposal.merchant_address.clone()));
+        }
+    }
+    
+    // Mark proposal as executed
+    proposal.executed = true;
+    env.storage().persistent().set(&proposal_key, &proposal);
+}
+
 // --- Merchant Registry and KYC Whitelisting Helper Functions ---
 
 fn is_merchant_registered(env: &Env, merchant: &Address) -> bool {
@@ -2434,3 +2863,5 @@ mod test_merchant_registry;
 mod test_formal_verification;
 #[cfg(test)]
 mod test_reentrancy_guard;
+#[cfg(test)]
+mod test_timelock_governance;
