@@ -1,5 +1,5 @@
 use clap::Parser;
-use prettytable::{Table, row};
+use prettytable::{row, Table};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -27,22 +27,28 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    
+
     let mut current_subs = args.subscribers as f64;
     let growth_rate = args.growth / 100.0;
     let churn_rate = args.churn / 100.0;
-    
+
     let mut table = Table::new();
-    table.add_row(row!["Month", "New Subs", "Lost Subs", "Net Subs", "Revenue ($)"]);
+    table.add_row(row![
+        "Month",
+        "New Subs",
+        "Lost Subs",
+        "Net Subs",
+        "Revenue ($)"
+    ]);
 
     for month in 1..=args.months {
         let newcomers = current_subs * growth_rate;
         let churners = current_subs * churn_rate;
         let net_growth = newcomers - churners;
         current_subs += net_growth;
-        
+
         let monthly_revenue = current_subs * args.fee;
-        
+
         table.add_row(row![
             month,
             format!("{:.1}", newcomers),
@@ -51,7 +57,7 @@ fn main() {
             format!("{:.2}", monthly_revenue.max(0.0))
         ]);
     }
-    
+
     println!("\nSubStream Creator Revenue Simulator");
     println!("----------------------------------");
     println!("Initial Subs: {}", args.subscribers);

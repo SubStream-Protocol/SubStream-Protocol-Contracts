@@ -7,3 +7,4 @@ target
 
 # Test snapshots
 contracts/*/test_snapshots
+AGENTS.md
