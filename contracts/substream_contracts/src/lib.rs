@@ -1,4 +1,4 @@
-﻿#![no_std]
+#![no_std]
 #[cfg(test)]
 extern crate std;
 use soroban_sdk::token::Client as TokenClient;
@@ -98,6 +98,14 @@ pub enum DataKey {
     AcceptedToken(Address),            // Issue #49: Creator's enforced stablecoin token
     DaoGrant(Address, Address),        // (dao, creator) — DAO treasury grant stream
     UserContributed(Address, Address), // (fan, creator) — lifetime tokens contributed by fan
+    TopFans(Address),                  // (creator) — Top 50 fans by contribution
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TopFan {
+    pub fan: Address,
+    pub amount: i128,
 }
 
 #[contracttype]
@@ -980,6 +988,14 @@ impl SubStreamContract {
             .unwrap_or(0)
     }
 
+    /// Returns the top 50 fans for a creator by total lifetime contributions.
+    pub fn get_top_fans(env: Env, creator: Address) -> soroban_sdk::Vec<TopFan> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TopFans(creator))
+            .unwrap_or(soroban_sdk::Vec::new(&env))
+    }
+
     // -----------------------------------------------------------------------
     // DAO Treasury Streaming — Grant Support
     // -----------------------------------------------------------------------
@@ -1811,6 +1827,95 @@ fn credit_creator_earnings(env: &Env, creator: &Address, amount: i128) {
     set_creator_stats(env, creator, &stats);
 }
 
+fn update_top_fans(env: &Env, creator: &Address, fan: &Address, new_amount: i128) {
+    let key = DataKey::TopFans(creator.clone());
+    let mut top_fans: soroban_sdk::Vec<TopFan> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(soroban_sdk::Vec::new(env));
+
+    let mut existing_idx: Option<u32> = None;
+    for i in 0..top_fans.len() {
+        if top_fans.get(i).unwrap().fan == *fan {
+            existing_idx = Some(i);
+            break;
+        }
+    }
+
+    if let Some(idx) = existing_idx {
+        // Update existing entry
+        top_fans.set(idx, TopFan {
+            fan: fan.clone(),
+            amount: new_amount,
+        });
+        // Bubble up if needed
+        let mut curr = idx;
+        while curr > 0 {
+            let prev = curr - 1;
+            if top_fans.get(prev).unwrap().amount < top_fans.get(curr).unwrap().amount {
+                let p_val = top_fans.get(prev).unwrap();
+                let c_val = top_fans.get(curr).unwrap();
+                top_fans.set(prev, c_val);
+                top_fans.set(curr, p_val);
+                curr = prev;
+            } else {
+                break;
+            }
+        }
+    } else {
+        // New fan
+        if top_fans.len() < 50 {
+            top_fans.push_back(TopFan {
+                fan: fan.clone(),
+                amount: new_amount,
+            });
+            // Bubble up
+            let mut curr = top_fans.len() - 1;
+            while curr > 0 {
+                let prev = curr - 1;
+                if top_fans.get(prev).unwrap().amount < top_fans.get(curr).unwrap().amount {
+                    let p_val = top_fans.get(prev).unwrap();
+                    let c_val = top_fans.get(curr).unwrap();
+                    top_fans.set(prev, c_val);
+                    top_fans.set(curr, p_val);
+                    curr = prev;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            // List full, check if we beat the last one (index 49)
+            let last_idx = 49;
+            if new_amount > top_fans.get(last_idx).unwrap().amount {
+                top_fans.set(last_idx, TopFan {
+                    fan: fan.clone(),
+                    amount: new_amount,
+                });
+                // Bubble up
+                let mut curr = last_idx;
+                while curr > 0 {
+                    let prev = curr - 1;
+                    if top_fans.get(prev).unwrap().amount < top_fans.get(curr).unwrap().amount {
+                        let p_val = top_fans.get(prev).unwrap();
+                        let c_val = top_fans.get(curr).unwrap();
+                        top_fans.set(prev, c_val);
+                        top_fans.set(curr, p_val);
+                        curr = prev;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    env.storage().persistent().set(&key, &top_fans);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+}
+
 /// Increments the fan's lifetime contribution counter for a creator and emits
 /// a `CliffUnlocked` event the first time the threshold is crossed.
 fn credit_fan_contribution(env: &Env, fan: &Address, creator: &Address, amount: i128) {
@@ -1824,6 +1929,9 @@ fn credit_fan_contribution(env: &Env, fan: &Address, creator: &Address, amount: 
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+
+    // Update the top 50 leaderboard
+    update_top_fans(env, creator, fan, next);
 
     // Emit CliffUnlocked exactly once — when the fan crosses the threshold.
     let threshold: i128 = env

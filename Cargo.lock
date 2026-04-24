@@ -1740,7 +1740,9 @@ dependencies = [
 name = "substream_contracts"
 version = "0.0.0"
 dependencies = [
+ "ed25519-dalek",
  "soroban-sdk",
+ "stellar-strkey 0.0.16",
 ]
 
 [[package]]
