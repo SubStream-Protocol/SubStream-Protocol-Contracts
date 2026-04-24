@@ -12,6 +12,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 soroban-sdk = { version = "25", features = ["testutils"] }
+ed25519-dalek = "2"
+stellar-strkey = "0.0.16"
 
 [dependencies.substream_contracts]
 path = ".."
@@ -19,6 +21,13 @@ path = ".."
 [[bin]]
 name = "withdrawal_consistency"
 path = "fuzz_targets/withdrawal_consistency.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "batch_import_signatures"
+path = "fuzz_targets/batch_import_signatures.rs"
 test = false
 doc = false
 bench = false

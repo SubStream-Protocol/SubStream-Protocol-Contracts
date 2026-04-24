@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 #[cfg(test)]
 extern crate std;
 use soroban_sdk::token::Client as TokenClient;
@@ -98,14 +98,6 @@ pub enum DataKey {
     AcceptedToken(Address),            // Issue #49: Creator's enforced stablecoin token
     DaoGrant(Address, Address),        // (dao, creator) — DAO treasury grant stream
     UserContributed(Address, Address), // (fan, creator) — lifetime tokens contributed by fan
-    TopFans(Address),                  // Top 50 fans for a creator
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FanContribution {
-    pub fan: Address,
-    pub total_contributed: i128,
 }
 
 #[contracttype]
@@ -988,14 +980,6 @@ impl SubStreamContract {
             .unwrap_or(0)
     }
 
-    /// Returns the top 50 fans by total lifetime contribution for a creator.
-    pub fn get_top_fans(env: Env, creator: Address) -> soroban_sdk::Vec<FanContribution> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::TopFans(creator))
-            .unwrap_or(soroban_sdk::Vec::new(&env))
-    }
-
     // -----------------------------------------------------------------------
     // DAO Treasury Streaming — Grant Support
     // -----------------------------------------------------------------------
@@ -1856,74 +1840,6 @@ fn credit_fan_contribution(env: &Env, fan: &Address, creator: &Address, amount: 
         }
         .publish(env);
     }
-
-    update_top_fans(env, fan, creator, next);
-}
-
-fn update_top_fans(env: &Env, fan: &Address, creator: &Address, total_contributed: i128) {
-    let key = DataKey::TopFans(creator.clone());
-    let mut top_fans: soroban_sdk::Vec<FanContribution> = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(soroban_sdk::Vec::new(env));
-
-    let mut existing_index: Option<u32> = None;
-    for i in 0..top_fans.len() {
-        if top_fans.get(i).unwrap().fan == *fan {
-            existing_index = Some(i);
-            break;
-        }
-    }
-
-    if let Some(index) = existing_index {
-        top_fans.set(
-            index,
-            FanContribution {
-                fan: fan.clone(),
-                total_contributed,
-            },
-        );
-    } else {
-        if top_fans.len() < 50 {
-            top_fans.push_back(FanContribution {
-                fan: fan.clone(),
-                total_contributed,
-            });
-        } else {
-            let last_fan = top_fans.get(top_fans.len() - 1).unwrap();
-            if total_contributed > last_fan.total_contributed {
-                top_fans.set(
-                    top_fans.len() - 1,
-                    FanContribution {
-                        fan: fan.clone(),
-                        total_contributed,
-                    },
-                );
-            } else {
-                return; // Not enough to be in top 50
-            }
-        }
-    }
-
-    // Sort top_fans by total_contributed descending
-    // Simple insertion sort or similar since Vec is small (max 50)
-    let n = top_fans.len();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let fan_i = top_fans.get(i).unwrap();
-            let fan_j = top_fans.get(j).unwrap();
-            if fan_j.total_contributed > fan_i.total_contributed {
-                top_fans.set(i, fan_j);
-                top_fans.set(j, fan_i);
-            }
-        }
-    }
-
-    env.storage().persistent().set(&key, &top_fans);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
 }
 
 fn distribute_and_collect(
@@ -2452,8 +2368,6 @@ pub fn is_reentrancy_guard_active(env: &Env) -> bool {
 
 #[cfg(test)]
 mod test;
-#[cfg(test)]
-mod test_top_fans;
 #[cfg(test)]
 mod test_cliff_access;
 #[cfg(test)]
