@@ -69,7 +69,7 @@ jobs:
         echo "Branch: ${{ github.ref_name }}" >> formal_verification_report.txt
     
     - name: Upload formal verification report
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: formal-verification-report
         path: contracts/substream_contracts/formal_verification_report.txt
@@ -163,7 +163,7 @@ jobs:
         echo "for institutional deployment readiness." >> comprehensive_report.txt
     
     - name: Upload comprehensive report
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: comprehensive-formal-verification-report
         path: contracts/substream_contracts/comprehensive_report.txt
