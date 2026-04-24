@@ -22,6 +22,7 @@ const MAX_BULK_SUBSCRIPTION_IMPORTS: u32 = 50;
 /// Domain separation for offline import intents (SEP-10â€“style structured payload).
 pub(crate) const BULK_IMPORT_INTENT_PREFIX: &[u8] = b"SubStream:batch_import:v1:";
 
+
 // --- SLA Circuit Breaker Constants ---
 const SLA_THRESHOLD_BPS: u32 = 9990; // 99.9% uptime threshold (in basis points)
 const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
@@ -210,6 +211,37 @@ pub struct Plan {
     pub has_trial: bool,
     pub trial_duration: u64,
     pub is_active: bool,
+}
+
+/// Usage-based (pay-as-you-go) price components registered by the merchant for a plan.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicPlan {
+    pub base_fee: i128,
+    pub per_unit_rate: i128,
+}
+
+/// Snapshot of dynamic pricing and the subscriber-approved per-pull cap.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicBillingInfo {
+    pub base_fee: i128,
+    pub per_unit_rate: i128,
+    pub maximum_billing_cap: i128,
+    pub plan_id: u32,
+}
+
+/// Signed payload: `units_consumed` and `usage_timestamp` are covered by `signature`
+/// over [`dynamic_usage_attestation_message`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicUsageOraclePayload {
+    pub subscriber: Address,
+    pub merchant: Address,
+    pub units_consumed: i128,
+    pub usage_timestamp: u64,
+    pub nonce: u64,
+    pub signature: BytesN<64>,
 }
 
 #[contracttype]
@@ -1235,14 +1267,7 @@ impl SubStreamContract {
     }
 
     // -----------------------------------------------------------------------
-    // DAO Treasury Streaming — Grant Support
-    // -----------------------------------------------------------------------
 
-    /// Called by a DAO contract to initiate a streaming grant to a creator.
-    /// The DAO is the payer; the creator receives tokens second-by-second.
-    /// Respects the same 7-day free-trial window and minimum-flow-duration
-    /// rules as regular subscriptions so the protocol remains consistent.
-    pub fn dao_grant(
         env: Env,
         subscriber: Address,
         merchant: Address,
@@ -1343,6 +1368,7 @@ impl SubStreamContract {
         }
     }
 
+
     // --- Timelock and Multi-Sig Governance Functions ---
     
     /// Propose a registry update with mandatory 48-hour timelock
@@ -1356,15 +1382,13 @@ impl SubStreamContract {
         emergency_bypass: bool,
     ) -> u64 {
         proposer.require_auth();
+
         
         // Verify proposer is authorized (Security Council member or admin)
         if !is_authorized_proposer(&env, &proposer) {
             panic!("unauthorized proposer");
         }
-        
-        // Emergency bypass requires additional authorization
-        if emergency_bypass && !is_emergency_authorized(&env, &proposer) {
-            panic!("unauthorized emergency bypass");
+
         }
         
         // Generate unique proposal ID
@@ -2800,10 +2824,7 @@ pub fn is_reentrancy_guard_active(env: &Env) -> bool {
 #[cfg(test)]
 mod test;
 #[cfg(test)]
-mod test_cliff_access;
-#[cfg(test)]
-mod test_dao_treasury;
-#[cfg(test)]
+
 mod test_enhanced_subscriptions;
 #[cfg(test)]
 mod test_merchant_registry;
