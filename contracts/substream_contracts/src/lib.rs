@@ -28,6 +28,14 @@ const SLA_THRESHOLD_BPS: u32 = 9990; // 99.9% uptime threshold (in basis points)
 const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
 const UPTIME_ORACLE_NONCE_TTL: u64 = 24 * 60 * 60; // 24 hour validity for oracle signatures
 
+// --- Cancel Velocity Circuit Breaker Constants ---
+const DAY_IN_SECONDS: u64 = 24 * 60 * 60;
+const HOUR_IN_SECONDS: u64 = 60 * 60;
+const CANCEL_VELOCITY_HOURLY_BUCKETS: u32 = 24;
+const CANCEL_VELOCITY_DAILY_BUCKETS: u32 = 30;
+const CANCEL_VELOCITY_MULTIPLIER: u32 = 5; // 500% of 30d average
+const CANCEL_VELOCITY_MIN_TRIGGER: u32 = 25; // Ignore small protocols / cold start noise
+
 // --- Merchant Registry and KYC Whitelisting Constants ---
 pub(crate) const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
 const MERCHANT_KYC_VALIDITY: u64 = 365 * 24 * 60 * 60; // 1 year validity for KYC credentials
@@ -104,6 +112,9 @@ pub enum DataKey {
     DaoGrant(Address, Address),        // (dao, creator) — DAO treasury grant stream
     UserContributed(Address, Address), // (fan, creator) — lifetime tokens contributed by fan
     TopFans(Address),                  // (creator) — Top 50 fans by contribution
+    CancelVelocityHourlyBuckets,
+    CancelVelocityDailyBuckets,
+    CancelVelocityBreakerState,
 }
 
 #[contracttype]
@@ -188,6 +199,45 @@ pub struct SLAStatus {
     pub cumulative_downtime_minutes: u64,
     pub current_penalty_period_start: u64,
     pub total_refund_owed: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HourlyCancelBucket {
+    pub hour_epoch: u64,
+    pub count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DailyCancelBucket {
+    pub day_epoch: u64,
+    pub count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VelocityCircuitBreakerState {
+    pub active: bool,
+    pub soft_pause_active: bool,
+    pub triggered_at: u64,
+    pub last_updated: u64,
+    pub last_velocity: u32,
+    pub last_threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelVelocityMetrics {
+    pub rolling_24h_cancellations: u32,
+    pub trailing_30d_cancellations: u32,
+    pub daily_average_30d: u32,
+    pub anomaly_threshold: u32,
+    pub circuit_breaker_active: bool,
+    pub soft_pause_active: bool,
+    pub triggered_at: u64,
+    pub hourly_bucket_count: u32,
+    pub daily_bucket_count: u32,
 }
 
 #[contracttype]
@@ -435,6 +485,13 @@ pub struct Unsubscribed {
     pub subscriber: Address,
     #[topic]
     pub creator: Address,
+}
+
+#[contractevent]
+pub struct VelocityAnomalyDetected {
+    pub current_velocity: u32,
+    pub threshold: u32,
+    pub timestamp: u64,
 }
 
 #[contractevent]
@@ -762,6 +819,8 @@ impl SubStreamContract {
         rate_per_second: i128,
         referrer: Option<Address>, // Add optional referrer parameter
     ) {
+        require_protocol_soft_pause_inactive(env);
+
         // Check if creator is a verified merchant (KYC or DAO approved)
         if !is_merchant_verified(&env, &creator) {
             panic!("creator is not a verified merchant");
@@ -866,6 +925,7 @@ impl SubStreamContract {
     }
 
     pub fn top_up(env: Env, subscriber: Address, stream_id: Address, amount: i128) {
+        require_protocol_soft_pause_inactive(&env);
         top_up_internal(&env, &subscriber, &stream_id, amount);
     }
 
@@ -873,7 +933,29 @@ impl SubStreamContract {
         cancel_internal(&env, &subscriber, &creator);
     }
 
+    pub fn get_cancel_velocity_metrics(env: Env) -> CancelVelocityMetrics {
+        sync_cancel_velocity_metrics(&env)
+    }
+
+    pub fn is_protocol_soft_paused(env: Env) -> bool {
+        read_velocity_circuit_breaker_state(&env).soft_pause_active
+    }
+
+    pub fn reset_cancel_velocity_circuit_breaker(env: Env, admin: Address) {
+        admin.require_auth();
+        require_contract_admin(&env, &admin);
+
+        let now = env.ledger().timestamp();
+        let mut state = read_velocity_circuit_breaker_state(&env);
+        state.active = false;
+        state.soft_pause_active = false;
+        state.triggered_at = 0;
+        state.last_updated = now;
+        write_velocity_circuit_breaker_state(&env, &state);
+    }
+
     pub fn tip(env: Env, user: Address, creator: Address, token: Address, amount: i128) {
+        require_protocol_soft_pause_inactive(&env);
         user.require_auth();
         if amount <= 0 || user == creator {
             panic!("invalid tip");
@@ -901,6 +983,8 @@ impl SubStreamContract {
         creators: soroban_sdk::Vec<Address>,
         percentages: soroban_sdk::Vec<u32>,
     ) {
+        require_protocol_soft_pause_inactive(&env);
+
         // Validate exactly 5 creators
         if creators.len() != 5 {
             panic!("group channel must contain exactly 5 creators");
@@ -1159,6 +1243,7 @@ impl SubStreamContract {
     
     // Helper function for merchants to register plans
     pub fn register_plan(env: Env, merchant: Address, plan: Plan) {
+        require_protocol_soft_pause_inactive(&env);
         merchant.require_auth();
 
         let plan_registry_key = DataKey::PlanRegistry(merchant.clone());
@@ -2257,6 +2342,13 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
         .remove(&DataKey::PendingMerchantPull(beneficiary.clone(), stream_id.clone()));
     env.storage().persistent().remove(&key);
     env.storage().temporary().remove(&key);
+
+    record_protocol_cancellation(env);
+    Unsubscribed {
+        subscriber: beneficiary.clone(),
+        creator: stream_id.clone(),
+    }
+    .publish(env);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2354,6 +2446,288 @@ fn is_creator_paused(env: &Env, creator: &Address) -> bool {
         .persistent()
         .get(&DataKey::ChannelPaused(creator.clone()))
         .unwrap_or(false)
+}
+
+fn require_contract_admin(env: &Env, admin: &Address) {
+    let stored_admin: Address = env
+        .storage()
+        .persistent()
+        .get(&DataKey::ContractAdmin)
+        .expect("not initialized");
+    if admin != &stored_admin {
+        panic!("admin only");
+    }
+}
+
+fn require_protocol_soft_pause_inactive(env: &Env) {
+    if read_velocity_circuit_breaker_state(env).soft_pause_active {
+        panic!("protocol soft paused");
+    }
+}
+
+fn default_hourly_cancel_buckets(env: &Env) -> soroban_sdk::Vec<HourlyCancelBucket> {
+    let mut buckets = soroban_sdk::Vec::new(env);
+    for _ in 0..CANCEL_VELOCITY_HOURLY_BUCKETS {
+        buckets.push_back(HourlyCancelBucket {
+            hour_epoch: 0,
+            count: 0,
+        });
+    }
+    buckets
+}
+
+fn default_daily_cancel_buckets(env: &Env) -> soroban_sdk::Vec<DailyCancelBucket> {
+    let mut buckets = soroban_sdk::Vec::new(env);
+    for _ in 0..CANCEL_VELOCITY_DAILY_BUCKETS {
+        buckets.push_back(DailyCancelBucket {
+            day_epoch: 0,
+            count: 0,
+        });
+    }
+    buckets
+}
+
+fn default_velocity_circuit_breaker_state() -> VelocityCircuitBreakerState {
+    VelocityCircuitBreakerState {
+        active: false,
+        soft_pause_active: false,
+        triggered_at: 0,
+        last_updated: 0,
+        last_velocity: 0,
+        last_threshold: CANCEL_VELOCITY_MIN_TRIGGER,
+    }
+}
+
+fn read_hourly_cancel_buckets(env: &Env) -> soroban_sdk::Vec<HourlyCancelBucket> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CancelVelocityHourlyBuckets)
+        .unwrap_or(default_hourly_cancel_buckets(env))
+}
+
+fn write_hourly_cancel_buckets(env: &Env, buckets: &soroban_sdk::Vec<HourlyCancelBucket>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::CancelVelocityHourlyBuckets, buckets);
+    env.storage().persistent().extend_ttl(
+        &DataKey::CancelVelocityHourlyBuckets,
+        TTL_THRESHOLD,
+        TTL_BUMP_AMOUNT,
+    );
+}
+
+fn read_daily_cancel_buckets(env: &Env) -> soroban_sdk::Vec<DailyCancelBucket> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CancelVelocityDailyBuckets)
+        .unwrap_or(default_daily_cancel_buckets(env))
+}
+
+fn write_daily_cancel_buckets(env: &Env, buckets: &soroban_sdk::Vec<DailyCancelBucket>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::CancelVelocityDailyBuckets, buckets);
+    env.storage().persistent().extend_ttl(
+        &DataKey::CancelVelocityDailyBuckets,
+        TTL_THRESHOLD,
+        TTL_BUMP_AMOUNT,
+    );
+}
+
+fn read_velocity_circuit_breaker_state(env: &Env) -> VelocityCircuitBreakerState {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CancelVelocityBreakerState)
+        .unwrap_or(default_velocity_circuit_breaker_state())
+}
+
+fn write_velocity_circuit_breaker_state(env: &Env, state: &VelocityCircuitBreakerState) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::CancelVelocityBreakerState, state);
+    env.storage().persistent().extend_ttl(
+        &DataKey::CancelVelocityBreakerState,
+        TTL_THRESHOLD,
+        TTL_BUMP_AMOUNT,
+    );
+}
+
+fn prune_hourly_cancel_buckets(now: u64, buckets: &mut soroban_sdk::Vec<HourlyCancelBucket>) {
+    let current_hour = now / HOUR_IN_SECONDS;
+    for i in 0..buckets.len() {
+        let mut bucket = buckets.get(i).unwrap();
+        if bucket.count > 0
+            && current_hour.saturating_sub(bucket.hour_epoch)
+                >= CANCEL_VELOCITY_HOURLY_BUCKETS as u64
+        {
+            bucket.hour_epoch = 0;
+            bucket.count = 0;
+            buckets.set(i, bucket);
+        }
+    }
+}
+
+fn prune_daily_cancel_buckets(now: u64, buckets: &mut soroban_sdk::Vec<DailyCancelBucket>) {
+    let current_day = now / DAY_IN_SECONDS;
+    for i in 0..buckets.len() {
+        let mut bucket = buckets.get(i).unwrap();
+        if bucket.count > 0
+            && current_day.saturating_sub(bucket.day_epoch)
+                >= CANCEL_VELOCITY_DAILY_BUCKETS as u64
+        {
+            bucket.day_epoch = 0;
+            bucket.count = 0;
+            buckets.set(i, bucket);
+        }
+    }
+}
+
+fn sum_hourly_cancel_buckets(now: u64, buckets: &soroban_sdk::Vec<HourlyCancelBucket>) -> u32 {
+    let current_hour = now / HOUR_IN_SECONDS;
+    let mut total = 0u32;
+    for i in 0..buckets.len() {
+        let bucket = buckets.get(i).unwrap();
+        if bucket.count > 0
+            && current_hour.saturating_sub(bucket.hour_epoch)
+                < CANCEL_VELOCITY_HOURLY_BUCKETS as u64
+        {
+            total = total.saturating_add(bucket.count);
+        }
+    }
+    total
+}
+
+fn sum_daily_cancel_buckets(now: u64, buckets: &soroban_sdk::Vec<DailyCancelBucket>) -> u32 {
+    let current_day = now / DAY_IN_SECONDS;
+    let mut total = 0u32;
+    for i in 0..buckets.len() {
+        let bucket = buckets.get(i).unwrap();
+        if bucket.count > 0
+            && current_day.saturating_sub(bucket.day_epoch)
+                < CANCEL_VELOCITY_DAILY_BUCKETS as u64
+        {
+            total = total.saturating_add(bucket.count);
+        }
+    }
+    total
+}
+
+fn calculate_cancel_velocity_threshold(trailing_30d_cancellations: u32) -> (u32, u32) {
+    let daily_average = if trailing_30d_cancellations == 0 {
+        0
+    } else {
+        (trailing_30d_cancellations + (CANCEL_VELOCITY_DAILY_BUCKETS - 1))
+            / CANCEL_VELOCITY_DAILY_BUCKETS
+    };
+    let baseline = daily_average.max(1);
+    let threshold = baseline
+        .saturating_mul(CANCEL_VELOCITY_MULTIPLIER)
+        .max(CANCEL_VELOCITY_MIN_TRIGGER);
+    (daily_average, threshold)
+}
+
+fn sync_cancel_velocity_metrics(env: &Env) -> CancelVelocityMetrics {
+    let now = env.ledger().timestamp();
+    let mut hourly_buckets = read_hourly_cancel_buckets(env);
+    let mut daily_buckets = read_daily_cancel_buckets(env);
+
+    prune_hourly_cancel_buckets(now, &mut hourly_buckets);
+    prune_daily_cancel_buckets(now, &mut daily_buckets);
+
+    let rolling_24h_cancellations = sum_hourly_cancel_buckets(now, &hourly_buckets);
+    let trailing_30d_cancellations = sum_daily_cancel_buckets(now, &daily_buckets);
+    let (daily_average_30d, anomaly_threshold) =
+        calculate_cancel_velocity_threshold(trailing_30d_cancellations);
+
+    let mut state = read_velocity_circuit_breaker_state(env);
+    state.last_updated = now;
+    state.last_velocity = rolling_24h_cancellations;
+    state.last_threshold = anomaly_threshold;
+
+    write_hourly_cancel_buckets(env, &hourly_buckets);
+    write_daily_cancel_buckets(env, &daily_buckets);
+    write_velocity_circuit_breaker_state(env, &state);
+
+    CancelVelocityMetrics {
+        rolling_24h_cancellations,
+        trailing_30d_cancellations,
+        daily_average_30d,
+        anomaly_threshold,
+        circuit_breaker_active: state.active,
+        soft_pause_active: state.soft_pause_active,
+        triggered_at: state.triggered_at,
+        hourly_bucket_count: hourly_buckets.len(),
+        daily_bucket_count: daily_buckets.len(),
+    }
+}
+
+fn record_protocol_cancellation(env: &Env) -> CancelVelocityMetrics {
+    let now = env.ledger().timestamp();
+    let current_hour = now / HOUR_IN_SECONDS;
+    let current_day = now / DAY_IN_SECONDS;
+
+    let mut hourly_buckets = read_hourly_cancel_buckets(env);
+    let mut daily_buckets = read_daily_cancel_buckets(env);
+    prune_hourly_cancel_buckets(now, &mut hourly_buckets);
+    prune_daily_cancel_buckets(now, &mut daily_buckets);
+
+    let hourly_idx = (current_hour % CANCEL_VELOCITY_HOURLY_BUCKETS as u64) as u32;
+    let daily_idx = (current_day % CANCEL_VELOCITY_DAILY_BUCKETS as u64) as u32;
+
+    let mut hour_bucket = hourly_buckets.get(hourly_idx).unwrap();
+    if hour_bucket.hour_epoch != current_hour {
+        hour_bucket.hour_epoch = current_hour;
+        hour_bucket.count = 0;
+    }
+    hour_bucket.count = hour_bucket.count.saturating_add(1);
+    hourly_buckets.set(hourly_idx, hour_bucket);
+
+    let mut day_bucket = daily_buckets.get(daily_idx).unwrap();
+    if day_bucket.day_epoch != current_day {
+        day_bucket.day_epoch = current_day;
+        day_bucket.count = 0;
+    }
+    day_bucket.count = day_bucket.count.saturating_add(1);
+    daily_buckets.set(daily_idx, day_bucket);
+
+    let rolling_24h_cancellations = sum_hourly_cancel_buckets(now, &hourly_buckets);
+    let trailing_30d_cancellations = sum_daily_cancel_buckets(now, &daily_buckets);
+    let (daily_average_30d, anomaly_threshold) =
+        calculate_cancel_velocity_threshold(trailing_30d_cancellations);
+
+    let mut state = read_velocity_circuit_breaker_state(env);
+    state.last_updated = now;
+    state.last_velocity = rolling_24h_cancellations;
+    state.last_threshold = anomaly_threshold;
+
+    if !state.active && rolling_24h_cancellations > anomaly_threshold {
+        state.active = true;
+        state.soft_pause_active = true;
+        state.triggered_at = now;
+
+        VelocityAnomalyDetected {
+            current_velocity: rolling_24h_cancellations,
+            threshold: anomaly_threshold,
+            timestamp: now,
+        }
+        .publish(env);
+    }
+
+    write_hourly_cancel_buckets(env, &hourly_buckets);
+    write_daily_cancel_buckets(env, &daily_buckets);
+    write_velocity_circuit_breaker_state(env, &state);
+
+    CancelVelocityMetrics {
+        rolling_24h_cancellations,
+        trailing_30d_cancellations,
+        daily_average_30d,
+        anomaly_threshold,
+        circuit_breaker_active: state.active,
+        soft_pause_active: state.soft_pause_active,
+        triggered_at: state.triggered_at,
+        hourly_bucket_count: hourly_buckets.len(),
+        daily_bucket_count: daily_buckets.len(),
+    }
 }
 
 // --- Referral Helper Functions ---
@@ -2570,3 +2944,5 @@ mod test_formal_verification;
 mod test_reentrancy_guard;
 #[cfg(test)]
 mod test_timelock_governance;
+#[cfg(test)]
+mod test_velocity_circuit_breaker;
