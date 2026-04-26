@@ -1,0 +1,40 @@
+specVersion: 0.0.5
+description: SubStream Protocol — on-chain subscription indexer
+repository: https://github.com/SubStream-Protocol/SubStream-Protocol-Contracts
+
+schema:
+  file: ./schema.graphql
+
+dataSources:
+  - kind: soroban/Contract
+    name: SubStreamProtocol
+    network: stellar-testnet
+    source:
+      address: "CAOUX2FZ65IDC4F2X7LJJ2SVF23A35CCTZB7KVVN475JCLKTTU4CEY6L"
+      startBlock: 0
+    mapping:
+      kind: soroban/EventHandler
+      apiVersion: 0.0.7
+      language: wasm/assemblyscript
+      entities:
+        - Subscription
+        - BillingEvent
+        - Merchant
+        - Receipt
+      abis:
+        - name: SubStreamProtocol
+          file: ./abis/SubStreamProtocol.json
+      eventHandlers:
+        - event: SubscriptionBilled
+          handler: handleSubscriptionBilled
+        - event: TrialStarted
+          handler: handleTrialStarted
+        - event: PaymentFailedGracePeriodStarted
+          handler: handlePaymentFailed
+        - event: B2BReceiptIssued
+          handler: handleB2BReceiptIssued
+        - event: SubscriptionCreated
+          handler: handleSubscriptionCreated
+        - event: Unsubscribed
+          handler: handleUnsubscribed
+      file: ./src/mapping.ts

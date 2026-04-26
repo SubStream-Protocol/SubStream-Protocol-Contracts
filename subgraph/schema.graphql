@@ -1,0 +1,58 @@
+type Subscription @entity {
+  id: ID!                        # "<subscriber>-<merchant>"
+  subscriber: Bytes!
+  merchant: Merchant!
+  status: String!                # "Trial" | "Active" | "PastDue" | "Canceled"
+  merchantReferenceId: String!
+  createdAt: BigInt!
+  updatedAt: BigInt!
+  billingEvents: [BillingEvent!]! @derivedFrom(field: "subscription")
+  receipts: [Receipt!]! @derivedFrom(field: "subscription")
+}
+
+type Merchant @entity {
+  id: ID!                        # merchant address
+  address: Bytes!
+  totalRevenue: BigInt!
+  activeSubscribers: BigInt!
+  totalSubscribers: BigInt!
+  subscriptions: [Subscription!]! @derivedFrom(field: "merchant")
+}
+
+type BillingEvent @entity {
+  id: ID!                        # "<txHash>-<logIndex>"
+  subscription: Subscription!
+  subscriber: Bytes!
+  merchant: Merchant!
+  amount: BigInt!
+  billedAt: BigInt!
+  merchantReferenceId: String!
+  receiptHash: Bytes!
+}
+
+type Receipt @entity {
+  id: ID!                        # receipt_hash hex
+  subscription: Subscription!
+  subscriber: Bytes!
+  merchant: Merchant!
+  receiptHash: Bytes!
+  amount: BigInt!
+  cycleNumber: BigInt!
+  issuedAt: BigInt!
+}
+
+type PaymentFailure @entity {
+  id: ID!
+  subscriber: Bytes!
+  merchant: Merchant!
+  merchantReferenceId: String!
+  dunningStartTimestamp: BigInt!
+  gracePeriodEnd: BigInt!
+}
+
+type ProtocolStats @entity {
+  id: ID!                        # always "global"
+  totalVolume: BigInt!
+  totalSubscriptions: BigInt!
+  activeSubscriptions: BigInt!
+}

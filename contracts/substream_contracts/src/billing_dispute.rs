@@ -1,13 +1,49 @@
 //! Pull-based billing, pending settlement, and DAO-juror dispute resolution.
 
 use crate::{
-    BillingCycleInfo, DataKey, DisputeRaised, DisputeRecord, DisputeResolved, JurorSignature,
-    PendingMerchantPullInfo, Plan, Subscription, SubscriptionBilled, SubscriptionStatus, Subscribed,
-    Tier, TokenClient, TrialConverted, TrialStarted, PaymentFailedGracePeriodStarted,
-    FREE_TRIAL_DURATION, GRACE_PERIOD, MINIMUM_FLOW_DURATION,
+    B2BReceiptIssued, BillingCycleInfo, DataKey, DisputeRaised, DisputeRecord, DisputeResolved,
+    JurorSignature, PendingMerchantPullInfo, Plan, Subscription, SubscriptionBilled,
+    SubscriptionStatus, Subscribed, Tier, TokenClient, TrialConverted, TrialStarted,
+    PaymentFailedGracePeriodStarted, FREE_TRIAL_DURATION, GRACE_PERIOD, MINIMUM_FLOW_DURATION,
 };
 use core::borrow::Borrow;
 use soroban_sdk::{vec, Address, Bytes, BytesN, Env, Vec};
+
+/// Issue #132: Generate a deterministic, collision-resistant receipt hash.
+/// hash = sha256(merchant_bytes || subscriber_bytes || amount_be || timestamp_be || cycle_be)
+fn generate_receipt(
+    env: &Env,
+    merchant: &Address,
+    subscriber: &Address,
+    amount: i128,
+    billed_at: u64,
+    cycle_number: u64,
+) -> BytesN<32> {
+    let mut buf = Bytes::new(env);
+    // Encode merchant address bytes
+    let merchant_bytes = merchant.to_xdr(env);
+    for b in merchant_bytes.iter() {
+        buf.push_back(b);
+    }
+    // Encode subscriber address bytes
+    let subscriber_bytes = subscriber.to_xdr(env);
+    for b in subscriber_bytes.iter() {
+        buf.push_back(b);
+    }
+    // Encode amount as 16-byte big-endian
+    for b in amount.to_be_bytes() {
+        buf.push_back(b);
+    }
+    // Encode billed_at as 8-byte big-endian
+    for b in billed_at.to_be_bytes() {
+        buf.push_back(b);
+    }
+    // Encode cycle_number as 8-byte big-endian
+    for b in cycle_number.to_be_bytes() {
+        buf.push_back(b);
+    }
+    env.crypto().sha256(&buf)
+}
 
 pub fn configure_dispute_jurors(env: &Env, admin: &Address, juror_pubkeys: Vec<BytesN<32>>) {
     admin.require_auth();
@@ -226,11 +262,17 @@ pub fn initialize_subscription(
     crate::register_creator_support(env, &merchant, &subscriber);
 
     if plan.has_trial {
+        let reference_id: soroban_sdk::String = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantReferenceId(subscriber.clone(), merchant.clone()))
+            .unwrap_or_else(|| soroban_sdk::String::from_str(env, ""));
         TrialStarted {
             subscriber: subscriber.clone(),
             merchant: merchant.clone(),
             trial_duration: plan.trial_duration,
             started_at: now,
+            merchant_reference_id: reference_id,
         }
         .publish(env);
     }
@@ -278,11 +320,17 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
             billing.status = SubscriptionStatus::PastDue;
             billing.dunning_start_timestamp = now;
             env.storage().persistent().set(&billing_key, &billing);
+            let reference_id: soroban_sdk::String = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MerchantReferenceId(subscriber.clone(), merchant.clone()))
+                .unwrap_or_else(|| soroban_sdk::String::from_str(env, ""));
             PaymentFailedGracePeriodStarted {
                 subscriber: subscriber.clone(),
                 merchant: merchant.clone(),
                 dunning_start_timestamp: now,
                 grace_period_end: now.saturating_add(GRACE_PERIOD),
+                merchant_reference_id: reference_id,
             }
             .publish(env);
         }
@@ -308,11 +356,35 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
         &pending,
     );
 
+    // Issue #130: look up the merchant's Web2 reference ID for this subscriber.
+    let reference_id: soroban_sdk::String = env
+        .storage()
+        .persistent()
+        .get(&DataKey::MerchantReferenceId(subscriber.clone(), merchant.clone()))
+        .unwrap_or_else(|| soroban_sdk::String::from_str(env, ""));
+
+    // Issue #132: generate deterministic receipt hash.
+    let cycle_number = billing.billing_cycle;
+    let receipt_hash = generate_receipt(env, &merchant, &subscriber, amount, pulled_at, cycle_number);
+
     SubscriptionBilled {
         subscriber: subscriber.clone(),
         merchant: merchant.clone(),
         amount,
         billed_at: pulled_at,
+        merchant_reference_id: reference_id,
+        receipt_hash: receipt_hash.clone(),
+    }
+    .publish(env);
+
+    // Issue #132: emit dedicated B2B receipt event.
+    B2BReceiptIssued {
+        subscriber: subscriber.clone(),
+        merchant: merchant.clone(),
+        receipt_hash,
+        amount,
+        cycle_number,
+        issued_at: pulled_at,
     }
     .publish(env);
 

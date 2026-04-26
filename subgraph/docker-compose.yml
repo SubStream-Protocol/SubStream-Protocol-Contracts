@@ -1,0 +1,43 @@
+version: "3"
+services:
+  graph-node:
+    image: graphprotocol/graph-node:latest
+    ports:
+      - "8000:8000"   # GraphQL HTTP
+      - "8001:8001"   # GraphQL WS
+      - "8020:8020"   # JSON-RPC admin
+      - "8030:8030"   # Subgraph indexing status
+      - "8040:8040"   # Prometheus metrics
+    depends_on:
+      - ipfs
+      - postgres
+    environment:
+      postgres_host: postgres
+      postgres_user: graph
+      postgres_pass: graph
+      postgres_db: graph-node
+      ipfs: "ipfs:5001"
+      ethereum: "stellar-testnet:https://soroban-testnet.stellar.org"
+      GRAPH_LOG: info
+
+  ipfs:
+    image: ipfs/kubo:v0.18.1
+    ports:
+      - "5001:5001"
+    volumes:
+      - ipfs_data:/data/ipfs
+
+  postgres:
+    image: postgres:14
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: graph
+      POSTGRES_PASSWORD: graph
+      POSTGRES_DB: graph-node
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+volumes:
+  ipfs_data:
+  pg_data:

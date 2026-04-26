@@ -1,0 +1,14 @@
+{
+  "name": "substream-protocol-subgraph",
+  "version": "1.0.0",
+  "scripts": {
+    "codegen": "graph codegen",
+    "build": "graph build",
+    "deploy:local": "graph deploy --node http://localhost:8020 substream-protocol",
+    "deploy:studio": "graph deploy --studio substream-protocol"
+  },
+  "dependencies": {
+    "@graphprotocol/graph-cli": "0.51.2",
+    "@graphprotocol/graph-ts": "0.31.0"
+  }
+}
