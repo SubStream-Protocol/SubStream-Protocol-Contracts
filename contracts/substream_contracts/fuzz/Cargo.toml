@@ -31,3 +31,10 @@ path = "fuzz_targets/batch_import_signatures.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "cancel_velocity_breaker"
+path = "fuzz_targets/cancel_velocity_breaker.rs"
+test = false
+doc = false
+bench = false
