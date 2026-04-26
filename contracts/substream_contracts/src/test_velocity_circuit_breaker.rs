@@ -24,7 +24,7 @@ fn seed_subscription(
         start_time: now,
         streak_start_date: now,
         last_funds_exhausted: 0,
-        free_to_paid_emitted: false,
+        flags: 0,
         creators: vec![env, creator.clone()],
         percentages: vec![env, 100u32],
         payer: subscriber.clone(),

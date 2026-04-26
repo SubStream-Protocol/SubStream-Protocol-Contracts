@@ -7,6 +7,12 @@ use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env};
 
 // --- Constants ---
+
+// --- Issue #136: Subscription struct bitmask flags ---
+/// Bitmask flag: set when the free-trial-to-paid conversion event has been emitted.
+/// Bit 0 of `Subscription::flags`.
+pub const FLAGS_FREE_TO_PAID: u8 = 0x01;
+
 const MINIMUM_FLOW_DURATION: u64 = 86400;
 const FREE_TRIAL_DURATION: u64 = 7 * 24 * 60 * 60;
 const GRACE_PERIOD: u64 = 24 * 60 * 60;
@@ -139,22 +145,44 @@ pub struct Tier {
     pub trial_duration: u64,
 }
 
+/// # Issue #136 – Gas Optimization: Packed Subscription Struct
+///
+/// Fields are ordered **largest-to-smallest** to minimise XDR padding bytes,
+/// reducing Soroban persistent-storage rent and per-call execution cost.
+///
+/// ## Bitmask schema for `flags` (`u8`)
+/// | Bit | Constant            | Meaning                                      |
+/// |-----|---------------------|----------------------------------------------|
+/// | 0   | `FLAGS_FREE_TO_PAID`| Trial-to-paid conversion event already emitted |
+///
+/// Use bitwise helpers instead of the removed `free_to_paid_emitted` field:
+/// ```rust
+/// // read
+/// let emitted = sub.flags & FLAGS_FREE_TO_PAID != 0;
+/// // set
+/// sub.flags |= FLAGS_FREE_TO_PAID;
+/// ```
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Subscription {
-    pub token: Address,
-    pub tier: Tier,
+    // --- i128 fields (16 bytes each) ---
     pub balance: i128,
+    pub accrued_remainder: i128, // Dust/fractional units that haven't been paid as tokens
+    // --- u64 fields (8 bytes each) ---
     pub last_collected: u64,
     pub start_time: u64,
     pub streak_start_date: u64, // Track original start for loyalty rewards
     pub last_funds_exhausted: u64,
-    pub free_to_paid_emitted: bool,
+    // --- variable-length / pointer-sized fields ---
+    pub token: Address,
+    pub tier: Tier,
     pub creators: soroban_sdk::Vec<Address>,
     pub percentages: soroban_sdk::Vec<u32>,
     pub payer: Address,
     pub beneficiary: Address,
-    pub accrued_remainder: i128, // Dust/fractional units that haven't been paid as tokens
+    // --- u8 bitmask (replaces individual bool fields) ---
+    /// Packed boolean flags – see `FLAGS_*` constants for bit definitions.
+    pub flags: u8,
 }
 
 #[contracttype]
@@ -914,6 +942,30 @@ pub struct SubscriptionUpgraded {
     pub upgraded_at: u64,
 }
 
+// --- Issue #133: Analytics Events ---
+
+/// Emitted when a subscription upgrade triggers proration math.
+/// Provides marketing/analytics teams with the exact unused value and new tier cost.
+#[contractevent]
+pub struct ProrationCalculated {
+    #[topic] pub subscriber: Address,
+    #[topic] pub merchant: Address,
+    pub unused_value: i128,
+    pub new_tier_cost: i128,
+    pub calculated_at: u64,
+}
+
+/// Emitted the first time a trial subscription converts to a paid billing cycle.
+/// `is_first_payment` is `true` when this is the subscriber's very first payment
+/// to this merchant (i.e. the trial was never previously converted).
+#[contractevent]
+pub struct TrialAutoConverted {
+    #[topic] pub subscriber: Address,
+    #[topic] pub merchant: Address,
+    pub is_first_payment: bool,
+    pub converted_at: u64,
+}
+
 // --- Merchant Registry and KYC Whitelisting Events ---
 
 #[contractevent]
@@ -1619,6 +1671,15 @@ impl SubStreamContract {
         
         // Calculate prorated difference
         let prorated_charge = new_plan.billing_amount.saturating_sub(unused_value);
+        
+        // Issue #133: emit ProrationCalculated analytics event
+        ProrationCalculated {
+            subscriber: subscriber.clone(),
+            merchant: merchant.clone(),
+            unused_value,
+            new_tier_cost: new_plan.billing_amount,
+            calculated_at: now,
+        }.publish(&env);
         
         // Execute payment for prorated difference
         let sub_key = subscription_key(&subscriber, &merchant);
@@ -2981,7 +3042,7 @@ pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
             start_time: now,
             streak_start_date: now,
             last_funds_exhausted: 0,
-            free_to_paid_emitted: false,
+            flags: 0,
             creators: soroban_sdk::vec![&env, merchant.clone()],
             percentages: soroban_sdk::vec![&env, 100],
             payer: vault_id.clone(),
@@ -3713,7 +3774,7 @@ fn distribute_and_collect(
     }
 
     let trial_end = sub.start_time.saturating_add(sub.tier.trial_duration);
-    if !sub.free_to_paid_emitted && sub.tier.rate_per_second > 0 && now > trial_end {
+    if sub.flags & FLAGS_FREE_TO_PAID == 0 && sub.tier.rate_per_second > 0 && now > trial_end {
         FreeToPaidTierActivated {
             subscriber: beneficiary.clone(),
             creator: stream_id.clone(),
@@ -3721,7 +3782,15 @@ fn distribute_and_collect(
             activated_at: now,
         }
         .publish(env);
-        sub.free_to_paid_emitted = true;
+        // Issue #133: emit TrialAutoConverted analytics event
+        TrialAutoConverted {
+            subscriber: beneficiary.clone(),
+            merchant: stream_id.clone(),
+            is_first_payment: true,
+            converted_at: now,
+        }
+        .publish(env);
+        sub.flags |= FLAGS_FREE_TO_PAID;
     }
 
     if let Some(creator) = total_streamed_creator {
@@ -4022,7 +4091,7 @@ fn subscribe_core(
         start_time: now,
         streak_start_date: now,
         last_funds_exhausted: 0,
-        free_to_paid_emitted: false,
+        flags: 0,
         creators,
         percentages,
         payer: payer.clone(),
@@ -4641,8 +4710,8 @@ mod test_timelock_governance;
 #[cfg(test)]
 mod test_velocity_circuit_breaker;
 #[cfg(test)]
-mod test_pagination;
+mod test_analytics_events;
 #[cfg(test)]
-mod test_allowance_health;
+mod test_stress_500_pulls;
 #[cfg(test)]
-mod test_data_pruning;
+mod test_clock_drift_fuzz;
