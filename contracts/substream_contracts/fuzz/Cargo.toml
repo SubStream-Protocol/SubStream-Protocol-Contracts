@@ -38,3 +38,10 @@ path = "fuzz_targets/cancel_velocity_breaker.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "micro_subscription_execution"
+path = "fuzz_targets/micro_subscription_execution.rs"
+test = false
+doc = false
+bench = false
