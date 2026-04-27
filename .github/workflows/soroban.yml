@@ -1,0 +1,61 @@
+name: Soroban CI Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Enforce Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint with Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Tests
+        run: cargo test
+
+      - name: Build Final WASM Release Artifact
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Measure Compilation Byte Size
+        id: wasm-size
+        run: |
+          WASM_FILE=$(find target/wasm32-unknown-unknown/release -maxdepth 1 -name "*.wasm" | head -n 1)
+          SIZE=$(stat -c%s "$WASM_FILE")
+          echo "$SIZE" > wasm_size.txt
+          echo "### Compilation Result 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "WASM Binary Size: **$SIZE bytes**" >> $GITHUB_STEP_SUMMARY
+
+      - name: Post Automated Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const size = fs.readFileSync('wasm_size.txt', 'utf8').trim();
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ **CI Pipeline Passed**\n\n📦 **Final WASM Byte Size:** \`${size} bytes\`\n\n_This automated comment helps monitor contract bloat and ledger rent costs._`
+            })

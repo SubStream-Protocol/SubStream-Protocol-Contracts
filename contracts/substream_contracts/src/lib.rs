@@ -4774,3 +4774,7 @@ mod test_analytics_events;
 mod test_stress_500_pulls;
 #[cfg(test)]
 mod test_clock_drift_fuzz;
+#[cfg(test)]
+mod test_allowance_invariant;
+#[cfg(test)]
+mod test_escrow_invariant;
