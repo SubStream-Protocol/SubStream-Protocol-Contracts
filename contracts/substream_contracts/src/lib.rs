@@ -1235,6 +1235,13 @@ pub struct SubStreamContract;
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl SubStreamContract {
+    /// One-time contract initialisation. Stores `admin` as the contract administrator.
+    ///
+    /// # Arguments
+    /// * `admin` – Address that will hold admin privileges (verify creators, reset circuit breakers, etc.).
+    ///
+    /// # Errors
+    /// Panics with `"already initialized"` if called more than once.
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().persistent().has(&DataKey::ContractAdmin) {
             panic!("already initialized");
@@ -1244,6 +1251,15 @@ impl SubStreamContract {
             .set(&DataKey::ContractAdmin, &admin);
     }
 
+    /// Mark a creator address as verified by the contract admin.
+    ///
+    /// # Arguments
+    /// * `admin`   – Must match the stored contract admin; requires auth.
+    /// * `creator` – Address to mark as a verified creator/merchant.
+    ///
+    /// # Errors
+    /// Panics with `"admin only"` if `admin` does not match the stored admin.
+    /// Panics with `"not initialized"` if the contract has not been initialised.
     pub fn verify_creator(env: Env, admin: Address, creator: Address) {
         admin.require_auth();
         let stored_admin: Address = env
@@ -1265,6 +1281,10 @@ impl SubStreamContract {
         .publish(&env);
     }
 
+    /// Returns `true` if `creator` has been verified by the contract admin.
+    ///
+    /// # Arguments
+    /// * `creator` – Address to query.
     pub fn is_creator_verified(env: Env, creator: Address) -> bool {
         env.storage()
             .persistent()
@@ -1272,6 +1292,25 @@ impl SubStreamContract {
             .unwrap_or(false)
     }
 
+    /// Start a pay-as-you-go subscription stream from `subscriber` to `creator`.
+    ///
+    /// Deposits `amount` tokens into the contract escrow and begins streaming at
+    /// `rate_per_second` (in nano-token units, i.e. `rate * PRECISION_MULTIPLIER`).
+    /// The first 7 days are a free trial — no charges accrue during that window.
+    ///
+    /// # Arguments
+    /// * `subscriber`      – Payer and beneficiary; requires auth.
+    /// * `creator`         – Verified merchant/creator receiving the stream.
+    /// * `token`           – SAC token address used for payment.
+    /// * `amount`          – Initial deposit (in token units).
+    /// * `rate_per_second` – Nano-token charge per second after the trial ends.
+    /// * `referrer`        – Optional referrer address for the 1% rebate programme.
+    ///
+    /// # Errors
+    /// Panics with `"exists"` if a subscription already exists for this pair.
+    /// Panics with `"creator is not a verified merchant"` if the creator is unverified.
+    /// Panics with `"rate below floor"` if `rate_per_second` is below the creator's minimum.
+    /// Panics with `"protocol soft paused"` when the cancel-velocity circuit breaker is active.
     pub fn subscribe(
         env: Env,
         subscriber: Address,
@@ -1294,6 +1333,25 @@ impl SubStreamContract {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Gift a subscription: `payer` funds the stream but `beneficiary` receives access.
+    ///
+    /// Identical to [`subscribe`] except the payer and beneficiary can differ,
+    /// enabling gifted subscriptions (e.g. a parent paying for a child's account).
+    ///
+    /// # Arguments
+    /// * `payer`           – Address that transfers tokens; requires auth.
+    /// * `beneficiary`     – Address that receives the subscription benefit.
+    /// * `creator`         – Verified merchant/creator receiving the stream.
+    /// * `token`           – SAC token address used for payment.
+    /// * `amount`          – Initial deposit (in token units).
+    /// * `rate_per_second` – Nano-token charge per second after the trial ends.
+    /// * `referrer`        – Optional referrer address for the 1% rebate programme.
+    ///
+    /// # Errors
+    /// Panics with `"exists"` if a subscription already exists for this pair.
+    /// Panics with `"creator is not a verified merchant"` if the creator is unverified.
+    /// Panics with `"rate below floor"` if `rate_per_second` is below the creator's minimum.
+    /// Panics with `"protocol soft paused"` when the cancel-velocity circuit breaker is active.
     pub fn subscribe_gift(
         env: &Env,
         payer: Address,
@@ -1354,6 +1412,14 @@ impl SubStreamContract {
         );
     }
 
+    /// Returns `true` if `subscriber` currently has an active (or grace-period) stream to `creator`.
+    ///
+    /// Accounts for the 7-day free trial, loyalty discounts, and the 24-hour grace period
+    /// that activates when the subscriber's balance runs out.
+    ///
+    /// # Arguments
+    /// * `subscriber` – Address of the subscriber.
+    /// * `creator`    – Address of the creator/merchant.
     pub fn is_subscribed(env: Env, subscriber: Address, creator: Address) -> bool {
         let key = subscription_key(&subscriber, &creator);
         if !subscription_exists(&env, &key) {
@@ -1405,27 +1471,79 @@ impl SubStreamContract {
         false
     }
 
+    /// Creator triggers withdrawal of all accumulated streaming charges from `subscriber`.
+    ///
+    /// Calculates the discounted charge for the elapsed period (respecting the 7-day trial
+    /// and loyalty discount tiers), transfers tokens to the creator(s), and updates
+    /// `last_collected`. No-ops during the free-trial window or when the channel is paused.
+    ///
+    /// # Arguments
+    /// * `subscriber` – Address of the subscriber whose stream is being collected.
+    /// * `creator`    – Address of the creator; must be the stream beneficiary.
     pub fn collect(env: Env, subscriber: Address, creator: Address) {
         distribute_and_collect(&env, &subscriber, &creator, Some(&creator));
     }
 
+    /// Add tokens to an existing subscription's escrow balance.
+    ///
+    /// Transfers `amount` tokens from the subscriber's wallet into the contract,
+    /// increasing the stream's remaining balance and potentially clearing a grace-period state.
+    ///
+    /// # Arguments
+    /// * `subscriber` – Address of the subscriber; requires auth.
+    /// * `stream_id`  – Creator/merchant address identifying the stream.
+    /// * `amount`     – Number of tokens to deposit (must be > 0).
+    ///
+    /// # Errors
+    /// Panics with `"protocol soft paused"` when the cancel-velocity circuit breaker is active.
     pub fn top_up(env: Env, subscriber: Address, stream_id: Address, amount: i128) {
         require_protocol_soft_pause_inactive(&env);
         top_up_internal(&env, &subscriber, &stream_id, amount);
     }
 
+    /// Cancel an active subscription and refund the remaining escrow balance to the payer.
+    ///
+    /// Enforces the 24-hour minimum flow duration (sybil protection): cancellation is
+    /// rejected if less than `MINIMUM_FLOW_DURATION` seconds have elapsed since subscription
+    /// start. Any accrued charges are settled before the refund is issued.
+    ///
+    /// # Arguments
+    /// * `subscriber` – Address of the subscriber; requires auth.
+    /// * `creator`    – Address of the creator/merchant.
+    ///
+    /// # Errors
+    /// Panics with `"too early to cancel"` if the minimum flow duration has not elapsed.
     pub fn cancel(env: Env, subscriber: Address, creator: Address) {
         cancel_internal(&env, &subscriber, &creator);
     }
 
+    /// Returns the current cancel-velocity circuit-breaker metrics.
+    ///
+    /// Includes rolling 24-hour and trailing 30-day cancellation counts, the anomaly
+    /// threshold, and whether the soft-pause or hard-pause is currently active.
     pub fn get_cancel_velocity_metrics(env: Env) -> CancelVelocityMetrics {
         sync_cancel_velocity_metrics(&env)
     }
 
+    /// Returns `true` when the cancel-velocity circuit breaker has triggered a soft pause.
+    ///
+    /// While soft-paused, new subscriptions and top-ups are blocked to protect creators
+    /// from coordinated cancel-scraping attacks.
     pub fn is_protocol_soft_paused(env: Env) -> bool {
         read_velocity_circuit_breaker_state(&env).soft_pause_active
     }
 
+    /// Admin-only: reset the cancel-velocity circuit breaker after a soft or hard pause.
+    ///
+    /// Clears both the soft-pause and hard-pause flags, allowing normal protocol operation
+    /// to resume. Should only be called after the root cause of the velocity spike has
+    /// been investigated and resolved.
+    ///
+    /// # Arguments
+    /// * `admin` – Must match the stored contract admin; requires auth.
+    ///
+    /// # Errors
+    /// Panics with `"admin only"` if `admin` does not match the stored admin.
     pub fn reset_cancel_velocity_circuit_breaker(env: Env, admin: Address) {
         admin.require_auth();
         require_contract_admin(&env, &admin);
@@ -1439,6 +1557,20 @@ impl SubStreamContract {
         write_velocity_circuit_breaker_state(&env, &state);
     }
 
+    /// Send a one-time tip directly from `user` to `creator`.
+    ///
+    /// Unlike streaming subscriptions, tips are instant token transfers with no escrow.
+    /// The fan's lifetime contribution counter is updated for cliff-access tracking.
+    ///
+    /// # Arguments
+    /// * `user`    – Sender of the tip; requires auth.
+    /// * `creator` – Recipient of the tip.
+    /// * `token`   – SAC token address used for the tip.
+    /// * `amount`  – Number of tokens to tip (must be > 0).
+    ///
+    /// # Errors
+    /// Panics with `"invalid tip"` if `amount <= 0` or `user == creator`.
+    /// Panics with `"protocol soft paused"` when the cancel-velocity circuit breaker is active.
     pub fn tip(env: Env, user: Address, creator: Address, token: Address, amount: i128) {
         require_protocol_soft_pause_inactive(&env);
         user.require_auth();
@@ -1458,6 +1590,25 @@ impl SubStreamContract {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Subscribe to a group channel that splits streaming revenue across exactly 5 creators.
+    ///
+    /// Validates that `creators.len() == 5` and `percentages` sum to exactly 100 before
+    /// delegating to `subscribe_core`. The same 7-day free trial and loyalty discount
+    /// rules apply as for single-creator subscriptions.
+    ///
+    /// # Arguments
+    /// * `payer`           – Payer and beneficiary; requires auth.
+    /// * `channel_id`      – Unique address identifying the group channel.
+    /// * `token`           – SAC token address used for payment.
+    /// * `amount`          – Initial deposit (in token units).
+    /// * `rate_per_second` – Nano-token charge per second after the trial ends.
+    /// * `creators`        – Exactly 5 creator addresses.
+    /// * `percentages`     – Revenue split percentages (must sum to 100).
+    ///
+    /// # Errors
+    /// Panics with `"group channel must contain exactly 5 creators"` if `creators.len() != 5`.
+    /// Panics with `"percentages must sum to 100"` if the splits do not add up.
+    /// Panics with `"protocol soft paused"` when the cancel-velocity circuit breaker is active.
     pub fn subscribe_group(
         env: Env,
         payer: Address,
@@ -1495,16 +1646,41 @@ impl SubStreamContract {
         );
     }
 
+    /// Collect accumulated streaming charges from a group-channel subscription.
+    ///
+    /// Distributes tokens to all 5 creators according to their configured percentage splits.
+    ///
+    /// # Arguments
+    /// * `subscriber`  – Address of the subscriber.
+    /// * `channel_id`  – Group channel address identifying the stream.
     pub fn collect_group(env: Env, subscriber: Address, channel_id: Address) {
         distribute_and_collect(&env, &subscriber, &channel_id, None);
     }
 
+    /// Cancel a group-channel subscription and refund the remaining balance to the payer.
+    ///
+    /// Subject to the same 24-hour minimum flow duration as single-creator cancellations.
+    ///
+    /// # Arguments
+    /// * `subscriber` – Address of the subscriber; requires auth.
+    /// * `channel_id` – Group channel address identifying the stream.
+    ///
+    /// # Errors
+    /// Panics with `"too early to cancel"` if the minimum flow duration has not elapsed.
     pub fn cancel_group(env: Env, subscriber: Address, channel_id: Address) {
         cancel_internal(&env, &subscriber, &channel_id);
     }
 
     // --- Blacklist functionality for Issue #25 ---
 
+    /// Blacklist a user from subscribing to the calling creator's channel.
+    ///
+    /// # Arguments
+    /// * `creator`        – Creator who is blocking the user; requires auth.
+    /// * `user_to_block`  – Address to add to the creator's blacklist.
+    ///
+    /// # Errors
+    /// Panics with `"user already blacklisted"` if the user is already on the list.
     pub fn blacklist_user(env: Env, creator: Address, user_to_block: Address) {
         creator.require_auth();
 
@@ -1526,6 +1702,14 @@ impl SubStreamContract {
         .publish(&env);
     }
 
+    /// Remove a user from the calling creator's blacklist.
+    ///
+    /// # Arguments
+    /// * `creator`          – Creator who is unblocking the user; requires auth.
+    /// * `user_to_unblock`  – Address to remove from the creator's blacklist.
+    ///
+    /// # Errors
+    /// Panics with `"user not blacklisted"` if the user is not currently blacklisted.
     pub fn unblacklist_user(env: Env, creator: Address, user_to_unblock: Address) {
         creator.require_auth();
 
@@ -1547,6 +1731,11 @@ impl SubStreamContract {
         .publish(&env);
     }
 
+    /// Returns `true` if `user` is on `creator`'s blacklist.
+    ///
+    /// # Arguments
+    /// * `creator` – Creator whose blacklist to query.
+    /// * `user`    – Address to check.
     pub fn is_user_blacklisted(env: Env, creator: Address, user: Address) -> bool {
         let blacklist_key = DataKey::BlacklistedUser(creator, user);
         env.storage()
@@ -1555,10 +1744,21 @@ impl SubStreamContract {
             .unwrap_or(false)
     }
 
+    /// Returns aggregated lifetime statistics for a creator: total earned, lifetime fans, active fans.
+    ///
+    /// # Arguments
+    /// * `creator` – Address of the creator.
     pub fn creator_stats(env: Env, creator: Address) -> CreatorStats {
         get_creator_stats(&env, &creator)
     }
 
+    /// Set the minimum acceptable streaming rate for a creator's channel.
+    ///
+    /// Subscriptions with `rate_per_second` below this floor will be rejected.
+    ///
+    /// # Arguments
+    /// * `creator`   – Creator setting the floor; requires auth.
+    /// * `min_rate`  – Minimum rate in nano-token units per second.
     pub fn set_minimum_rate(env: Env, creator: Address, min_rate: i128) {
         creator.require_auth();
         env.storage()
@@ -1566,6 +1766,14 @@ impl SubStreamContract {
             .set(&DataKey::MinimumRate(creator), &min_rate);
     }
 
+    /// Set a community funding goal for a creator (in tokens per day).
+    ///
+    /// The goal is stored as a per-second flow rate. Use [`is_community_goal_met`]
+    /// to check whether the current aggregate inflow meets the target.
+    ///
+    /// # Arguments
+    /// * `creator`              – Creator setting the goal; requires auth.
+    /// * `goal_tokens_per_day`  – Target inflow in whole tokens per day.
     pub fn set_community_goal(env: Env, creator: Address, goal_tokens_per_day: i128) {
         creator.require_auth();
         // Convert tokens/day to flow rate (units per second)
@@ -1576,6 +1784,10 @@ impl SubStreamContract {
             .set(&DataKey::CommunityGoal(creator), &goal_per_sec);
     }
 
+    /// Returns `true` if the creator's current aggregate inflow meets their community goal.
+    ///
+    /// # Arguments
+    /// * `creator` – Address of the creator.
     pub fn is_community_goal_met(env: Env, creator: Address) -> bool {
         let goal: i128 = env
             .storage()
@@ -1595,6 +1807,13 @@ impl SubStreamContract {
     }
 
     // --- Issue #49: Stablecoin-Only Enforcement ---
+    /// Restrict a creator's channel to accept only a specific token.
+    ///
+    /// Once set, any subscription attempt using a different token will be rejected.
+    ///
+    /// # Arguments
+    /// * `creator` – Creator enforcing the token restriction; requires auth.
+    /// * `token`   – SAC token address that will be the only accepted payment token.
     pub fn set_accepted_token(env: Env, creator: Address, token: Address) {
         creator.require_auth();
         env.storage()
@@ -1658,6 +1877,20 @@ impl SubStreamContract {
     // -----------------------------------------------------------------------
     // Multi-Tier Subscription Upgrade
     // -----------------------------------------------------------------------
+    /// Upgrade a pull-based subscription to a higher-priced plan with pro-rated billing.
+    ///
+    /// Calculates the unused value remaining in the current billing cycle and charges
+    /// only the prorated difference for the new plan. Downgrades are not permitted.
+    ///
+    /// # Arguments
+    /// * `subscriber`   – Address of the subscriber; requires auth.
+    /// * `merchant`     – Address of the merchant.
+    /// * `new_tier_id`  – Plan ID of the target tier (must be higher than current).
+    ///
+    /// # Errors
+    /// Panics with `"subscription not found"` if no billing cycle exists.
+    /// Panics with `"cannot downgrade"` if `new_tier_id` is not higher than the current plan.
+    /// Panics with `"no plans found"` or `"new plan not found or inactive"` if the plan is invalid.
     pub fn upgrade_subscription(
         env: Env,
         subscriber: Address,
@@ -1738,6 +1971,18 @@ impl SubStreamContract {
     }
     
     // Helper function for merchants to register plans
+    /// Register a new billing plan for a merchant.
+    ///
+    /// Plans define the billing amount, cycle duration, and optional trial period.
+    /// Once registered, a plan ID cannot be reused.
+    ///
+    /// # Arguments
+    /// * `merchant` – Merchant registering the plan; requires auth.
+    /// * `plan`     – [`Plan`] struct with `plan_id`, `billing_amount`, `billing_cycle`, etc.
+    ///
+    /// # Errors
+    /// Panics with `"plan ID already exists"` if the plan ID is already registered.
+    /// Panics with `"protocol soft paused"` when the cancel-velocity circuit breaker is active.
     pub fn register_plan(env: Env, merchant: Address, plan: Plan) {
         require_protocol_soft_pause_inactive(&env);
         merchant.require_auth();
@@ -1770,6 +2015,13 @@ impl SubStreamContract {
     }
     
     // Helper function to get subscription status
+    /// Returns the current [`SubscriptionStatus`] for a pull-based subscription.
+    ///
+    /// Returns `SubscriptionStatus::Canceled` if no billing cycle record exists.
+    ///
+    /// # Arguments
+    /// * `subscriber` – Address of the subscriber.
+    /// * `merchant`   – Address of the merchant.
     pub fn get_subscription_status(env: Env, subscriber: Address, merchant: Address) -> SubscriptionStatus {
         let billing_key = DataKey::BillingCycle(subscriber, merchant);
         if let Some(billing_info) = env.storage().persistent().get::<BillingCycleInfo>(&billing_key) {
@@ -2007,7 +2259,18 @@ impl SubStreamContract {
     
     // --- Merchant Registry and KYC Whitelisting Functions ---
 
-    // Register a merchant with SEP-12 KYC verification
+    /// Register a merchant with SEP-12 KYC verification.
+    ///
+    /// Validates that `issuer` matches the authorised SEP-12 KYC issuer address,
+    /// stores the credential hash, and marks the merchant as verified.
+    ///
+    /// # Arguments
+    /// * `merchant`              – Merchant being registered; requires auth.
+    /// * `kyc_credential_hash`   – Hash of the off-chain KYC credential document.
+    /// * `issuer`                – Must equal the hard-coded `SEP12_KYC_ISSUER` address.
+    ///
+    /// # Errors
+    /// Panics with `"unauthorized KYC issuer"` if `issuer` is not the trusted issuer.
     pub fn register_merchant_with_kyc(
         env: Env,
         merchant: Address,
@@ -2089,7 +2352,19 @@ impl SubStreamContract {
         }.publish(&env);
     }
     
-    // Create DAO proposal for merchant approval
+    /// Create a DAO proposal to whitelist or blacklist a merchant.
+    ///
+    /// Returns the newly created `proposal_id`. Proposals require a 3-of-5 DAO vote
+    /// before they can be executed.
+    ///
+    /// # Arguments
+    /// * `proposer`       – DAO member creating the proposal; requires auth.
+    /// * `merchant`       – Merchant address the proposal targets.
+    /// * `proposal_type`  – [`ProposalType::WhitelistMerchant`] or [`ProposalType::BlacklistMerchant`].
+    /// * `description`    – Human-readable rationale for the proposal.
+    ///
+    /// # Errors
+    /// Panics with `"unauthorized proposer"` if `proposer` is not an authorised DAO member.
     pub fn create_merchant_proposal(
         env: Env,
         proposer: Address,
@@ -2131,7 +2406,17 @@ impl SubStreamContract {
         proposal_id
     }
     
-    // Vote on merchant proposal
+    /// Cast a vote on an open merchant DAO proposal.
+    ///
+    /// # Arguments
+    /// * `voter`       – Authorised DAO voter; requires auth.
+    /// * `proposal_id` – ID of the proposal to vote on.
+    /// * `vote`        – `true` = vote for, `false` = vote against.
+    ///
+    /// # Errors
+    /// Panics with `"unauthorized voter"` if `voter` is not an authorised DAO member.
+    /// Panics with `"proposal not found"` if the proposal ID does not exist.
+    /// Panics with `"already voted"` if the voter has already cast a vote on this proposal.
     pub fn vote_on_merchant_proposal(env: Env, voter: Address, proposal_id: u64, vote: bool) {
         voter.require_auth();
         
@@ -2189,7 +2474,15 @@ impl SubStreamContract {
         }
     }
     
-    // Blacklist a merchant (DAO only)
+    /// Immediately blacklist a merchant (DAO-only emergency action).
+    ///
+    /// # Arguments
+    /// * `dao_member` – Authorised DAO member; requires auth.
+    /// * `merchant`   – Merchant address to blacklist.
+    /// * `reason`     – Human-readable reason for the blacklisting.
+    ///
+    /// # Errors
+    /// Panics with `"unauthorized DAO member"` if `dao_member` is not authorised.
     pub fn blacklist_merchant(env: Env, dao_member: Address, merchant: Address, reason: soroban_sdk::String) {
         dao_member.require_auth();
         
@@ -2218,7 +2511,10 @@ impl SubStreamContract {
         }.publish(&env);
     }
     
-    // Check if merchant is verified
+    /// Returns `true` if `merchant` is verified and not blacklisted.
+    ///
+    /// # Arguments
+    /// * `merchant` – Address to query.
     pub fn is_merchant_verified(env: Env, merchant: Address) -> bool {
         if let Some(merchant_status) = env.storage().persistent().get::<MerchantStatus>(&DataKey::MerchantRegistry(merchant)) {
             merchant_status.is_verified && !merchant_status.is_blacklisted
@@ -2227,7 +2523,13 @@ impl SubStreamContract {
         }
     }
     
-    // Get merchant status
+    /// Returns the full [`MerchantStatus`] record for a merchant.
+    ///
+    /// # Arguments
+    /// * `merchant` – Address to query.
+    ///
+    /// # Errors
+    /// Panics with `"merchant not found"` if the merchant has not been registered.
     pub fn get_merchant_status(env: Env, merchant: Address) -> MerchantStatus {
         env.storage().persistent()
             .get(&DataKey::MerchantRegistry(merchant))
@@ -2241,6 +2543,19 @@ impl SubStreamContract {
     const NULLIFIER_CLEANUP_BATCH_SIZE: u64 = 100; // Process up to 100 nullifiers per cleanup
     
     // Verify anonymous subscription with ZK-proof and nullifier
+    /// Verify a zero-knowledge proof for an anonymous subscription and record the nullifier.
+    ///
+    /// Prevents replay attacks by storing the nullifier for 30 days. If the nullifier
+    /// has already been used, the call panics and emits a `ReplayAttackBlocked` event.
+    ///
+    /// # Arguments
+    /// * `merchant`  – Verified merchant address.
+    /// * `proof`     – ZK proof bytes (validated off-chain; stored for auditability).
+    /// * `nullifier` – Unique nullifier that prevents proof reuse.
+    ///
+    /// # Errors
+    /// Panics with `"merchant is not verified"` if the merchant is not KYC-verified.
+    /// Panics with `"replay attack detected: nullifier already used"` on duplicate nullifier.
     pub fn verify_anonymous_subscription(
         env: Env,
         merchant: Address,
@@ -2294,6 +2609,15 @@ impl SubStreamContract {
     }
     
     // Try to verify anonymous subscription (returns Result for testing)
+    /// Fallible variant of [`verify_anonymous_subscription`] that returns a `Result`.
+    ///
+    /// Useful in test harnesses where panicking on replay is undesirable.
+    /// Returns `Err` with contract error code `1` on failure instead of panicking.
+    ///
+    /// # Arguments
+    /// * `merchant`  – Verified merchant address.
+    /// * `proof`     – ZK proof bytes.
+    /// * `nullifier` – Unique nullifier that prevents proof reuse.
     pub fn try_verify_anonymous_subscription(
         env: Env,
         merchant: Address,
@@ -2348,6 +2672,10 @@ impl SubStreamContract {
     }
     
     // Cleanup expired nullifiers to prevent storage bloat
+    /// Scan and remove nullifiers that have passed their 30-day validity window.
+    ///
+    /// Processes up to `NULLIFIER_CLEANUP_BATCH_SIZE` (100) entries per call to bound
+    /// gas usage. Can be called by anyone as a permissionless maintenance operation.
     pub fn cleanup_expired_nullifiers(env: Env) {
         // Create reentrancy guard
         let _guard = reentrancy_guard!(&env, "cleanup_expired_nullifiers");
@@ -2379,6 +2707,10 @@ impl SubStreamContract {
     }
     
     // Check if nullifier exists (for testing purposes)
+    /// Returns `true` if the given nullifier has already been recorded (used).
+    ///
+    /// # Arguments
+    /// * `nullifier` – Nullifier bytes to check.
     pub fn is_nullifier_used(env: Env, nullifier: soroban_sdk::Bytes) -> bool {
         env.storage().persistent().has(&DataKey::Nullifier(nullifier))
     }
@@ -2904,6 +3236,21 @@ pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
 // =========================================================================
 
 // These functions have been moved inside the impl block above
+    /// Create a multi-signature family vault for shared subscription allowances.
+    ///
+    /// The vault requires `threshold`-of-`signers` approval for delegate operations.
+    /// The first signer in the list is treated as the vault creator and must authenticate.
+    ///
+    /// # Arguments
+    /// * `vault_id`  – Unique address identifying the vault.
+    /// * `signers`   – List of authorised signers (at least `threshold` required).
+    /// * `threshold` – Minimum number of signers required to authorise vault actions.
+    /// * `allowance` – Maximum token allowance the vault can spend.
+    /// * `token`     – SAC token address used by the vault.
+    ///
+    /// # Errors
+    /// Panics with `"signers count less than threshold"` if `signers.len() < threshold`.
+    /// Panics with `"threshold must be positive"` if `threshold == 0`.
     pub fn create_family_vault(
         env: Env,
         vault_id: Address,
@@ -4778,3 +5125,5 @@ mod test_clock_drift_fuzz;
 mod test_allowance_invariant;
 #[cfg(test)]
 mod test_escrow_invariant;
+#[cfg(test)]
+mod test_e2e_lifecycle;

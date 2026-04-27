@@ -45,6 +45,9 @@ jobs:
       - name: Run Unit Tests
         run: cargo test
 
+      - name: Check Doc-Comments (Issue #147)
+        run: bash scripts/check_doc_comments.sh
+
       - name: Install tarpaulin
         run: cargo install cargo-tarpaulin
 
