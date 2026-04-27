@@ -45,6 +45,13 @@ fn generate_receipt(
     env.crypto().sha256(&buf)
 }
 
+/// Configure the set of juror public keys used for dispute resolution.
+///
+/// # Auth
+/// Requires `admin` authorization and must match the stored contract admin.
+///
+/// # Errors
+/// Panics if `admin` is not the stored contract admin.
 pub fn configure_dispute_jurors(env: &Env, admin: &Address, juror_pubkeys: Vec<BytesN<32>>) {
     admin.require_auth();
     let stored_admin: Address = env
@@ -60,6 +67,9 @@ pub fn configure_dispute_jurors(env: &Env, admin: &Address, juror_pubkeys: Vec<B
         .set(&DataKey::DisputeJurorKeys, &juror_pubkeys);
 }
 
+/// Compute the deterministic digest that jurors sign to cast a dispute verdict.
+///
+/// digest = sha256(dispute_id_be || user_wins_byte)
 pub fn dispute_verdict_digest(env: &Env, dispute_id: u64, user_wins: bool) -> BytesN<32> {
     let mut buf = Bytes::new(env);
     for b in dispute_id.to_be_bytes() {
@@ -129,6 +139,10 @@ fn verify_juror_threshold(
     }
 }
 
+/// Release a pending pull to the merchant if the 48-hour dispute window has elapsed
+/// and no active dispute exists.
+///
+/// This is a no-op if no pending pull exists or the window has not yet elapsed.
 pub fn maybe_release_expired_pending_pull(
     env: &Env,
     subscriber: &Address,
@@ -159,6 +173,16 @@ pub fn maybe_release_expired_pending_pull(
     env.storage().persistent().remove(&pending_key);
 }
 
+/// Initialize a pull-based billing subscription for a subscriber-merchant pair.
+///
+/// Creates the `BillingCycleInfo` record and the underlying `Subscription` stream.
+/// If the plan has a trial, the subscription starts in `Trial` status.
+///
+/// # Auth
+/// Requires `subscriber` authorization.
+///
+/// # Errors
+/// Panics if a subscription already exists, the plan is not found, or the trial has already been used.
 pub fn initialize_subscription(
     env: &Env,
     subscriber: Address,
@@ -285,6 +309,17 @@ pub fn initialize_subscription(
     .publish(env);
 }
 
+/// Merchant-triggered pull: charge the subscriber for the current billing cycle.
+///
+/// Transfers `billing_amount` from the subscriber's allowance into a 48-hour
+/// dispute escrow. If the allowance is insufficient, the subscription enters
+/// `PastDue` (dunning) status and a `PaymentFailedGracePeriodStarted` event is emitted.
+///
+/// # Auth
+/// Requires `merchant` authorization.
+///
+/// # Errors
+/// Panics if the subscription is disputed, canceled, or the billing date has not yet arrived.
 pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Address) {
     merchant.require_auth();
     let contract = env.current_contract_address();
@@ -404,6 +439,16 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
     env.storage().persistent().set(&billing_key, &billing);
 }
 
+/// Subscriber raises a billing dispute, locking the pending pull in escrow.
+///
+/// Requires a `bond_amount` from the subscriber as a spam-prevention bond.
+/// The subscription enters `Disputed` status until the dispute is resolved.
+///
+/// # Auth
+/// Requires `subscriber` authorization.
+///
+/// # Errors
+/// Panics if no pending pull exists within the 48-hour dispute window.
 pub fn raise_dispute(env: &Env, subscriber: Address, merchant: Address, bond_amount: i128) {
     subscriber.require_auth();
     if bond_amount <= 0 {
@@ -475,6 +520,10 @@ pub fn raise_dispute(env: &Env, subscriber: Address, merchant: Address, bond_amo
     .publish(env);
 }
 
+/// Resolve a dispute in the subscriber's favour (juror multi-sig required).
+///
+/// Refunds the disputed amount and bond to the subscriber.
+/// Requires `DAO_MULTISIG_THRESHOLD` valid juror signatures.
 pub fn resolve_dispute_for_user(
     env: &Env,
     subscriber: Address,
@@ -485,6 +534,10 @@ pub fn resolve_dispute_for_user(
     resolve_dispute(env, &subscriber, &merchant, dispute_id, true, juror_sigs);
 }
 
+/// Resolve a dispute in the merchant's favour (juror multi-sig required).
+///
+/// Releases the escrowed amount to the merchant and the bond to the subscriber.
+/// Requires `DAO_MULTISIG_THRESHOLD` valid juror signatures.
 pub fn resolve_dispute_for_merchant(
     env: &Env,
     subscriber: Address,

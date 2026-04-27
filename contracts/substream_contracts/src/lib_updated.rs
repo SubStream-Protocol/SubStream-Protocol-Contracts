@@ -147,6 +147,10 @@ pub struct SubStreamContract;
 
 #[contractimpl]
 impl SubStreamContract {
+    /// Initialize the contract and set the contract admin.
+    ///
+    /// # Errors
+    /// Panics if the contract has already been initialized.
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().persistent().has(&DataKey::ContractAdmin) {
             panic!("already initialized");
