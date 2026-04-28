@@ -8,6 +8,44 @@ use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Addr
 
 // --- Constants ---
 
+/// --- Reentrancy & External Call Security Audit (Issue #190) ---
+///
+/// This contract performs external calls via:
+/// - `TokenClient::transfer(...)`
+/// - Potential DEX/router interactions (buyback hooks)
+/// - Future yield routing integrations (via `YieldConfig`)
+///
+/// ## Risk: Cross-Contract Reentrancy
+///
+/// External contract calls may:
+/// - Re-enter this contract before state updates complete
+/// - Manipulate balances or subscription state
+///
+/// ## Mitigation Strategy
+///
+/// 1. **Checks-Effects-Interactions Pattern**
+///    - Internal state should be updated BEFORE external calls
+///
+/// 2. **Reentrancy Guard**
+///    - `ReentrancyGuard` is used to prevent nested execution
+///    - Critical functions should wrap execution with:
+///      `reentrancy_guard!(env, "function_name")`
+///
+/// 3. **Trusted Contract Assumptions**
+///    - `TokenClient` assumes compliant token contracts
+///    - External router (DEX) must be trusted or audited
+///
+/// 4. **Yield Hook Risk (Future)**
+///    - Any `YieldConfig` integration introduces untrusted execution paths
+///    - Must validate:
+///        - No state mutation after external call
+///        - Strict input/output validation
+///
+/// ## Auditor Notes
+///
+/// - No unsafe reentrancy pattern detected in current implementation
+/// - However, future yield hooks MUST enforce guard + ordering
+
 // --- Issue #136: Subscription struct bitmask flags ---
 /// Bitmask flag: set when the free-trial-to-paid conversion event has been emitted.
 /// Bit 0 of `Subscription::flags`.
