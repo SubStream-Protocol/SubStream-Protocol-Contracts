@@ -5403,6 +5403,52 @@ fn set_sla_status(env: &Env, creator: &Address, status: &SLAStatus) {
         .set(&DataKey::SLAStatus(creator.clone()), status);
 }
 
+fn validate_oracle_payload_freshness(env: &Env, payload: &UptimeOraclePayload) {
+    let now = env.ledger().timestamp();
+
+    if payload.period_end > now {
+        panic!("oracle timestamp invalid");
+    }
+
+    if payload.period_end.saturating_add(UPTIME_ORACLE_NONCE_TTL) < now {
+        panic!("oracle data stale");
+    }
+
+    let nonce_key = DataKey::UptimeOracleNonce(payload.nonce);
+    if env.storage().persistent().has(&nonce_key) {
+        panic!("oracle nonce reused");
+    }
+
+    env.storage().persistent().set(&nonce_key, &true);
+}
+
+pub fn submit_uptime_oracle_data(env: Env, payload: UptimeOraclePayload) {
+    // ✅ Fail-safe validation (main requirement)
+    validate_oracle_payload_freshness(&env, &payload);
+
+    let penalty_active = payload.uptime_percentage < SLA_THRESHOLD_BPS;
+
+    let refund_amount = if penalty_active {
+        calculate_sla_refund(&env, &payload.creator, payload.downtime_minutes)
+    } else {
+        0
+    };
+
+    let status = SLAStatus {
+        active: penalty_active,
+        last_updated: env.ledger().timestamp(),
+        cumulative_downtime_minutes: payload.downtime_minutes,
+        current_penalty_period_start: if penalty_active {
+            payload.period_start
+        } else {
+            0
+        },
+        total_refund_owed: refund_amount,
+    };
+
+    set_sla_status(&env, &payload.creator, &status);
+}
+
 fn calculate_sla_refund(env: &Env, creator: &Address, downtime_minutes: u64) -> i128 {
     // Calculate refund based on downtime: 1 minute of downtime = 1 minute of service cost
     // Get the average rate for this creator across all active subscriptions
