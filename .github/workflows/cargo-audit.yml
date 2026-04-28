@@ -1,0 +1,30 @@
+name: Dependency Vulnerability Scan
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Run daily at 06:00 UTC to catch newly published CVEs
+    - cron: "0 6 * * *"
+
+jobs:
+  cargo-audit:
+    name: cargo-audit (CVE scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Fetch latest advisory database
+        run: cargo audit fetch
+
+      - name: Audit dependencies
+        # Fail the pipeline on any high-severity vulnerability
+        run: cargo audit --deny warnings
