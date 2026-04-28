@@ -243,6 +243,8 @@ pub fn initialize_subscription(
     env.storage()
         .persistent()
         .set(&billing_key, &billing_info);
+    // Issue #184: Bump TTL for billing cycle entry to keep it alive during subscription lifecycle
+    env.storage().persistent().extend_ttl(&billing_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 
     let rate = plan.billing_amount / plan.billing_cycle as i128;
     let trial_duration = if plan.has_trial {
@@ -271,6 +273,8 @@ pub fn initialize_subscription(
     };
     let sub_key = crate::subscription_key(&subscriber, &merchant);
     crate::set_subscription(env, &sub_key, &sub);
+    // Issue #184: Bump TTL for subscription entry to keep it alive during subscription lifecycle
+    env.storage().persistent().extend_ttl(&sub_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 
     let mut total_flow: i128 = env
         .storage()
@@ -386,10 +390,10 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
         token: sub.token.clone(),
         pulled_at,
     };
-    env.storage().persistent().set(
-        &DataKey::PendingMerchantPull(subscriber.clone(), merchant.clone()),
-        &pending,
-    );
+    let pending_key = DataKey::PendingMerchantPull(subscriber.clone(), merchant.clone());
+    env.storage().persistent().set(&pending_key, &pending);
+    // Issue #184: Bump TTL for pending pull entry to keep it alive during dispute window
+    env.storage().persistent().extend_ttl(&pending_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 
     // Issue #130: look up the merchant's Web2 reference ID for this subscriber.
     let reference_id: soroban_sdk::String = env
@@ -437,6 +441,12 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
         billing.dunning_start_timestamp = 0;
     }
     env.storage().persistent().set(&billing_key, &billing);
+    // Issue #184: Bump TTL for billing cycle entry to keep it alive during active subscription
+    env.storage().persistent().extend_ttl(&billing_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
+
+    // Issue #184: Bump TTL for the subscription entry itself to keep it alive during recurring billing
+    let sub_key = crate::subscription_key(&subscriber, &merchant);
+    env.storage().persistent().extend_ttl(&sub_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 }
 
 /// Subscriber raises a billing dispute, locking the pending pull in escrow.
@@ -498,16 +508,19 @@ pub fn raise_dispute(env: &Env, subscriber: Address, merchant: Address, bond_amo
         raised_at: now,
         resolved: false,
     };
-    env.storage()
-        .persistent()
-        .set(&DataKey::DisputeRecord(dispute_id), &record);
-    env.storage()
-        .persistent()
-        .set(&active_key, &dispute_id);
+    let record_key = DataKey::DisputeRecord(dispute_id);
+    env.storage().persistent().set(&record_key, &record);
+    // Issue #184: Bump TTL for dispute record to keep it alive during dispute resolution
+    env.storage().persistent().extend_ttl(&record_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
+    env.storage().persistent().set(&active_key, &dispute_id);
+    // Issue #184: Bump TTL for active dispute key to keep it alive during dispute resolution
+    env.storage().persistent().extend_ttl(&active_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
     env.storage().persistent().remove(&pending_key);
 
     billing.status = SubscriptionStatus::Disputed;
     env.storage().persistent().set(&billing_key, &billing);
+    // Issue #184: Bump TTL for billing cycle entry during dispute
+    env.storage().persistent().extend_ttl(&billing_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 
     DisputeRaised {
         dispute_id,
@@ -624,6 +637,8 @@ fn resolve_dispute(
             billing.next_billing_date = now.saturating_add(billing.billing_cycle);
         }
         env.storage().persistent().set(&billing_key, &billing);
+        // Issue #184: Bump TTL for billing cycle entry after dispute resolution
+        env.storage().persistent().extend_ttl(&billing_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
     }
 
     if user_wins {
