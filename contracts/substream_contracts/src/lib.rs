@@ -7,6 +7,23 @@ use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env};
 
 // --- Constants ---
+/// Frontend Error Mapping Documentation
+///
+/// This contract uses `panic!` messages as error signals.
+/// Frontend applications should map these exact strings
+/// to user-friendly messages.
+///
+/// already initialized -> Contract is already initialized.
+/// not initialized -> Contract has not been initialized.
+/// admin only -> Only admin can perform this action.
+/// creator is not a verified merchant -> Creator is not verified.
+/// exists -> Subscription already exists.
+/// protocol soft paused -> Protocol is temporarily paused.
+/// invalid tip -> Invalid tip amount.
+/// user already blacklisted -> User is already blacklisted.
+/// user not blacklisted -> User is not blacklisted.
+/// group channel must contain exactly 5 creators -> Group must have exactly 5 creators.
+/// percentages must sum to 100 -> Percentages must sum to 100.
 
 // --- Issue #136: Subscription struct bitmask flags ---
 /// Bitmask flag: set when the free-trial-to-paid conversion event has been emitted.
@@ -3861,7 +3878,7 @@ pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
             .persistent()
             .get(&DataKey::Tombstone(subscriber, creator))
     }
-}
+
 
 /// Helper function to adjust all active subscriptions for a merchant after vacation mode
 /// This extends the subscription duration by the pause duration to preserve paid-for time
