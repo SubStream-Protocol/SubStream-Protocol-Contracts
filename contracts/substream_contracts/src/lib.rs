@@ -45,7 +45,6 @@ const CANCEL_VELOCITY_MIN_TRIGGER: u32 = 25; // Ignore small protocols / cold st
 // --- Merchant Registry and KYC Whitelisting Constants ---
 pub(crate) const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
 const MERCHANT_KYC_VALIDITY: u64 = 365 * 24 * 60 * 60; // 1 year validity for KYC credentials
-const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
 const TIMELOCK_DURATION: u64 = 48 * 60 * 60; // 48-hour timelock for registry updates
 const SECURITY_COUNCIL_SIZE: u32 = 5; // 5-member security council for multi-sig
 
@@ -144,6 +143,9 @@ pub enum DataKey {
     SecurityCouncilVeto(Address, u64),     // (council_member, proposal_id)
     // --- Merchant reference ID for webhook payloads (issue #130) ---
     MerchantReferenceId(Address, Address), // (subscriber, merchant)
+    // --- Secure Initialization Pattern (Issue #199) ---
+    ContractInitialized,                   // Flag to prevent re-initialization
+    KYCIssuer,                            // Configurable KYC issuer address
     // --- Misc persistent ---
     MinimumRate(Address),
     CommunityGoal(Address),
@@ -1235,20 +1237,73 @@ pub struct SubStreamContract;
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl SubStreamContract {
-    /// Initialize the contract and set the contract admin.
+    /// Initialize the contract with secure initialization pattern (Issue #199).
+    ///
+    /// This function atomically initializes the contract admin, security council members,
+    /// and KYC issuer to prevent hijacking of the master merchant registry.
     ///
     /// # Arguments
     /// * `admin` — Address that will hold admin privileges.
+    /// * `security_council` — Exactly 5 addresses for the security council (3-of-5 multi-sig).
+    /// * `kyc_issuer` — Authorized SEP-12 KYC issuer address.
     ///
     /// # Errors
-    /// Panics if the contract has already been initialized.
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().persistent().has(&DataKey::ContractAdmin) {
+    /// Panics if the contract has already been initialized, security council size is not 5,
+    /// or if any address is invalid.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        security_council: soroban_sdk::Vec<Address>,
+        kyc_issuer: Address,
+    ) {
+        // Prevent re-initialization
+        if env.storage().persistent().has(&DataKey::ContractInitialized) {
             panic!("already initialized");
         }
+
+        // Validate security council size
+        if security_council.len() != SECURITY_COUNCIL_SIZE as usize {
+            panic!("security council must have exactly 5 members");
+        }
+
+        // Validate no duplicate security council members
+        for i in 0..security_council.len() {
+            for j in (i + 1)..security_council.len() {
+                if security_council.get(i).unwrap() == security_council.get(j).unwrap() {
+                    panic!("duplicate security council member");
+                }
+            }
+        }
+
+        let now = env.ledger().timestamp();
+
+        // Set contract admin
         env.storage()
             .persistent()
             .set(&DataKey::ContractAdmin, &admin);
+
+        // Set KYC issuer
+        env.storage()
+            .persistent()
+            .set(&DataKey::KYCIssuer, &kyc_issuer);
+
+        // Initialize security council members atomically
+        for i in 0..security_council.len() {
+            let member = security_council.get(i).unwrap();
+            let council_member = SecurityCouncilMember {
+                member: member.clone(),
+                added_at: now,
+                is_active: true,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::SecurityCouncilMember(member.clone()), &council_member);
+        }
+
+        // Set initialization flag to prevent re-initialization
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractInitialized, &true);
     }
 
     /// Grant verified-creator status to a creator address.
@@ -2190,37 +2245,12 @@ impl SubStreamContract {
         }.publish(&env);
     }
     
-    /// Initialize Security Council (5 members)
+    /// DEPRECATED: Security council initialization is now part of the main initialize function.
+    /// This function is kept for backward compatibility but will always fail.
+    /// Use the new initialize function with security council parameters instead.
+    #[deprecated(note = "Use initialize() with security council parameter")]
     pub fn initialize_security_council(env: Env, admin: Address, council_members: soroban_sdk::Vec<Address>) {
-        admin.require_auth();
-        
-        // Verify admin authorization
-        let stored_admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ContractAdmin)
-            .expect("not initialized");
-        if admin != stored_admin {
-            panic!("admin only");
-        }
-        
-        // Verify exactly 5 members
-        if council_members.len() != SECURITY_COUNCIL_SIZE as usize {
-            panic!("security council must have exactly 5 members");
-        }
-        
-        let now = env.ledger().timestamp();
-        
-        // Add all council members
-        for i in 0..council_members.len() {
-            let member = council_members.get(i).unwrap();
-            let council_member = SecurityCouncilMember {
-                member: member.clone(),
-                added_at: now,
-                is_active: true,
-            };
-            env.storage().persistent().set(&DataKey::SecurityCouncilMember(member.clone()), &council_member);
-        }
+        panic!("initialize_security_council is deprecated. Security council must be initialized atomically via initialize()");
     }
     
     // --- Merchant Registry and KYC Whitelisting Functions ---
@@ -2230,13 +2260,14 @@ impl SubStreamContract {
     /// # Arguments
     /// * `merchant` — Address of the merchant to register.
     /// * `kyc_credential_hash` — Hash of the KYC credential issued by the SEP-12 provider.
-    /// * `issuer` — Must match the authorized `SEP12_KYC_ISSUER` address.
+    /// * `issuer` — Must match the configured KYC issuer address.
     ///
     /// # Auth
     /// Requires `merchant` authorization.
     ///
     /// # Errors
-    /// Panics if the issuer is not the authorized SEP-12 KYC provider or the merchant is blacklisted.
+    /// Panics if the issuer is not the authorized KYC provider, the merchant is blacklisted,
+    /// or the contract is not properly initialized.
     pub fn register_merchant_with_kyc(
         env: Env,
         merchant: Address,
@@ -2244,33 +2275,27 @@ impl SubStreamContract {
         issuer: Address,
     ) {
         merchant.require_auth();
-        
-        // Verify issuer is authorized SEP-12 KYC provider
-        let authorized_issuer = Address::from_string(&soroban_sdk::String::from_str(&env, SEP12_KYC_ISSUER));
+
+        // Verify contract is properly initialized
+        if !is_contract_initialized(&env) {
+            panic!("contract not initialized");
+        }
+
+        // Verify issuer is authorized KYC provider (from configuration, not hardcoded)
+        let authorized_issuer: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::KYCIssuer)
+            .expect("KYC issuer not configured");
         if issuer != authorized_issuer {
             panic!("unauthorized KYC issuer");
         }
 
-        let elapsed = (now - charge_start) as i128;
-        let accrued = elapsed
-            .saturating_mul(grant.rate_per_second)
-            .saturating_add(grant.accrued_remainder);
-        let payout_tokens = accrued / PRECISION_MULTIPLIER;
-        let available_tokens = grant.balance / PRECISION_MULTIPLIER;
-        let actual_payout = payout_tokens.min(available_tokens);
-
-        if actual_payout > 0 {
-            let token_client = TokenClient::new(&env, &grant.token);
-            token_client.transfer(&env.current_contract_address(), &creator, &actual_payout);
-            credit_creator_earnings(&env, &creator, actual_payout);
-            credit_fan_contribution(&env, &grant.dao, &creator, actual_payout);
-        }
-        
         // Check if merchant is blacklisted
         if is_merchant_blacklisted(&env, &merchant) {
             panic!("merchant is blacklisted");
         }
-        
+
         let now = env.ledger().timestamp();
         
         // Create KYC credential
@@ -2489,6 +2514,26 @@ impl SubStreamContract {
         env.storage().persistent()
             .get(&DataKey::MerchantRegistry(merchant))
             .expect("merchant not found")
+    }
+
+    // --- Secure Initialization Helper Functions (Issue #199) ---
+
+    /// Returns `true` if the contract has been properly initialized.
+    pub fn is_initialized(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::ContractInitialized)
+    }
+
+    /// Returns the configured KYC issuer address.
+    ///
+    /// # Errors
+    /// Panics if the contract is not initialized.
+    pub fn get_kyc_issuer(env: Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::KYCIssuer)
+            .expect("contract not initialized")
     }
 
     // --- Anonymous Subscription Verification with Nullifier Tracking ---
@@ -4972,6 +5017,15 @@ fn get_current_plan_id(env: &Env, merchant: &Address, billing_amount: i128) -> u
         }
     }
     0 // Default plan ID if not found
+}
+
+// --- Secure Initialization Helper Functions (Issue #199) ---
+
+/// Internal helper to check if the contract has been properly initialized.
+fn is_contract_initialized(env: &Env) -> bool {
+    env.storage()
+        .persistent()
+        .has(&DataKey::ContractInitialized)
 }
 
 // --- Global Reentrancy Guard Helper Functions ---

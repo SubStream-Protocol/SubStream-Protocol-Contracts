@@ -14,10 +14,18 @@ fn test_merchant_registration_with_kyc() {
     let admin = Address::random(&env);
     let merchant = Address::random(&env);
     let kyc_issuer = Address::from_string(&soroban_sdk::String::from_str(&env, "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"));
-    
-    // Initialize contract
-    SubStreamContract::initialize(env.clone(), admin.clone());
-    
+
+    // Create security council members
+    let council_member1 = Address::random(&env);
+    let council_member2 = Address::random(&env);
+    let council_member3 = Address::random(&env);
+    let council_member4 = Address::random(&env);
+    let council_member5 = Address::random(&env);
+    let security_council = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone(), council_member4.clone(), council_member5.clone()];
+
+    // Initialize contract with security council and KYC issuer
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council, kyc_issuer.clone());
+
     // Register merchant with valid KYC
     let kyc_hash = vec![&env; 32u8]; // Mock KYC hash
     SubStreamContract::register_merchant_with_kyc(
@@ -26,15 +34,15 @@ fn test_merchant_registration_with_kyc() {
         kyc_hash.clone(),
         kyc_issuer.clone(),
     );
-    
+
     // Verify merchant is registered and verified
     assert!(SubStreamContract::is_merchant_verified(env.clone(), merchant.clone()));
-    
+
     let merchant_status = SubStreamContract::get_merchant_status(env.clone(), merchant.clone());
     assert!(merchant_status.is_verified);
     assert!(!merchant_status.is_blacklisted);
     assert!(matches!(merchant_status.verification_method, VerificationMethod::SEP12KYC));
-    
+
     // Verify KYC credential is stored
     let kyc_credential_key = DataKey::KYCCredential(merchant.clone());
     let stored_kyc: KYCCredential = env.storage().persistent().get(&kyc_credential_key).unwrap();
@@ -50,11 +58,20 @@ fn test_merchant_registration_unauthorized_issuer() {
     let contract_id = env.register_contract(None, SubStreamContract);
     let admin = Address::random(&env);
     let merchant = Address::random(&env);
+    let kyc_issuer = Address::from_string(&soroban_sdk::String::from_str(&env, "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"));
     let unauthorized_issuer = Address::random(&env);
-    
-    // Initialize contract
-    SubStreamContract::initialize(env.clone(), admin.clone());
-    
+
+    // Create security council members
+    let council_member1 = Address::random(&env);
+    let council_member2 = Address::random(&env);
+    let council_member3 = Address::random(&env);
+    let council_member4 = Address::random(&env);
+    let council_member5 = Address::random(&env);
+    let security_council = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone(), council_member4.clone(), council_member5.clone()];
+
+    // Initialize contract with security council and KYC issuer
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council, kyc_issuer.clone());
+
     // Try to register merchant with unauthorized KYC issuer
     let kyc_hash = vec![&env; 32u8];
     let result = env.try_invoke_contract::<(), (
@@ -64,7 +81,7 @@ fn test_merchant_registration_unauthorized_issuer() {
         &kyc_hash,
         &unauthorized_issuer,
     );
-    
+
     // Should fail with unauthorized KYC issuer error
     assert!(result.is_err());
     assert!(!SubStreamContract::is_merchant_verified(env.clone(), merchant.clone()));
@@ -77,9 +94,18 @@ fn test_dao_proposal_and_approval() {
     let admin = Address::random(&env);
     let merchant = Address::random(&env);
     let proposer = Address::random(&env);
-    
-    // Initialize contract
-    SubStreamContract::initialize(env.clone(), admin.clone());
+    let kyc_issuer = Address::random(&env);
+
+    // Create security council members
+    let council_member1 = Address::random(&env);
+    let council_member2 = Address::random(&env);
+    let council_member3 = Address::random(&env);
+    let council_member4 = Address::random(&env);
+    let council_member5 = Address::random(&env);
+    let security_council = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone(), council_member4.clone(), council_member5.clone()];
+
+    // Initialize contract with security council and KYC issuer
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council, kyc_issuer);
     
     // First register merchant (without KYC for DAO approval test)
     let merchant_status = MerchantStatus {
@@ -129,9 +155,17 @@ fn test_merchant_blacklisting() {
     let admin = Address::random(&env);
     let merchant = Address::random(&env);
     let kyc_issuer = Address::from_string(&soroban_sdk::String::from_str(&env, "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"));
-    
-    // Initialize contract
-    SubStreamContract::initialize(env.clone(), admin.clone());
+
+    // Create security council members
+    let council_member1 = Address::random(&env);
+    let council_member2 = Address::random(&env);
+    let council_member3 = Address::random(&env);
+    let council_member4 = Address::random(&env);
+    let council_member5 = Address::random(&env);
+    let security_council = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone(), council_member4.clone(), council_member5.clone()];
+
+    // Initialize contract with security council and KYC issuer
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council, kyc_issuer.clone());
     
     // Register merchant with KYC
     let kyc_hash = vec![&env; 32u8];
@@ -169,9 +203,18 @@ fn test_subscription_to_unverified_merchant_fails() {
     let subscriber = Address::random(&env);
     let unverified_merchant = Address::random(&env);
     let token = Address::random(&env);
-    
-    // Initialize contract
-    SubStreamContract::initialize(env.clone(), admin.clone());
+    let kyc_issuer = Address::random(&env);
+
+    // Create security council members
+    let council_member1 = Address::random(&env);
+    let council_member2 = Address::random(&env);
+    let council_member3 = Address::random(&env);
+    let council_member4 = Address::random(&env);
+    let council_member5 = Address::random(&env);
+    let security_council = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone(), council_member4.clone(), council_member5.clone()];
+
+    // Initialize contract with security council and KYC issuer
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council, kyc_issuer);
     
     // Try to subscribe to unverified merchant
     let result = env.try_invoke_contract::<(), (
@@ -198,9 +241,17 @@ fn test_subscription_to_blacklisted_merchant_fails() {
     let merchant = Address::random(&env);
     let kyc_issuer = Address::from_string(&soroban_sdk::String::from_str(&env, "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"));
     let token = Address::random(&env);
-    
-    // Initialize contract
-    SubStreamContract::initialize(env.clone(), admin.clone());
+
+    // Create security council members
+    let council_member1 = Address::random(&env);
+    let council_member2 = Address::random(&env);
+    let council_member3 = Address::random(&env);
+    let council_member4 = Address::random(&env);
+    let council_member5 = Address::random(&env);
+    let security_council = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone(), council_member4.clone(), council_member5.clone()];
+
+    // Initialize contract with security council and KYC issuer
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council, kyc_issuer.clone());
     
     // Register merchant with KYC
     let kyc_hash = vec![&env; 32u8];
@@ -244,9 +295,17 @@ fn test_blacklisted_merchant_cannot_collect_funds() {
     let merchant = Address::random(&env);
     let kyc_issuer = Address::from_string(&soroban_sdk::String::from_str(&env, "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"));
     let token = Address::random(&env);
-    
-    // Initialize contract
-    SubStreamContract::initialize(env.clone(), admin.clone());
+
+    // Create security council members
+    let council_member1 = Address::random(&env);
+    let council_member2 = Address::random(&env);
+    let council_member3 = Address::random(&env);
+    let council_member4 = Address::random(&env);
+    let council_member5 = Address::random(&env);
+    let security_council = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone(), council_member4.clone(), council_member5.clone()];
+
+    // Initialize contract with security council and KYC issuer
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council, kyc_issuer.clone());
     
     // Register merchant with KYC
     let kyc_hash = vec![&env; 32u8];
@@ -293,9 +352,17 @@ fn test_merchant_cannot_register_twice() {
     let admin = Address::random(&env);
     let merchant = Address::random(&env);
     let kyc_issuer = Address::from_string(&soroban_sdk::String::from_str(&env, "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"));
-    
-    // Initialize contract
-    SubStreamContract::initialize(env.clone(), admin.clone());
+
+    // Create security council members
+    let council_member1 = Address::random(&env);
+    let council_member2 = Address::random(&env);
+    let council_member3 = Address::random(&env);
+    let council_member4 = Address::random(&env);
+    let council_member5 = Address::random(&env);
+    let security_council = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone(), council_member4.clone(), council_member5.clone()];
+
+    // Initialize contract with security council and KYC issuer
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council, kyc_issuer.clone());
     
     // Register merchant with KYC
     let kyc_hash = vec![&env; 32u8];
@@ -328,9 +395,18 @@ fn test_dao_proposal_voting_mechanism() {
     let proposer = Address::random(&env);
     let voter1 = Address::random(&env);
     let voter2 = Address::random(&env);
-    
-    // Initialize contract
-    SubStreamContract::initialize(env.clone(), admin.clone());
+    let kyc_issuer = Address::random(&env);
+
+    // Create security council members
+    let council_member1 = Address::random(&env);
+    let council_member2 = Address::random(&env);
+    let council_member3 = Address::random(&env);
+    let council_member4 = Address::random(&env);
+    let council_member5 = Address::random(&env);
+    let security_council = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone(), council_member4.clone(), council_member5.clone()];
+
+    // Initialize contract with security council and KYC issuer
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council, kyc_issuer);
     
     // Set up merchant for proposal
     let merchant_status = MerchantStatus {
@@ -371,10 +447,18 @@ fn test_events_emission() {
     let contract_id = env.register_contract(None, SubStreamContract);
     let admin = Address::random(&env);
     let merchant = Address::random(&env);
-    let kyc_issuer = Address::from_string(&soroban_sdk::String::from_str(&env, "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"));
-    
-    // Initialize contract
-    SubStreamContract::initialize(env.clone(), admin.clone());
+    let kyc_issuer = Address::from_string(&soroban_sdk::String::from_str(&env, "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"));
+
+    // Create security council members
+    let council_member1 = Address::random(&env);
+    let council_member2 = Address::random(&env);
+    let council_member3 = Address::random(&env);
+    let council_member4 = Address::random(&env);
+    let council_member5 = Address::random(&env);
+    let security_council = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone(), council_member4.clone(), council_member5.clone()];
+
+    // Initialize contract with security council and KYC issuer
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council, kyc_issuer.clone());
     
     // Register merchant and check events
     let kyc_hash = vec![&env; 32u8];
