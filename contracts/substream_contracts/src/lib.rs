@@ -102,6 +102,17 @@ const CANCEL_VELOCITY_DAILY_BUCKETS: u32 = 30;
 const CANCEL_VELOCITY_MULTIPLIER: u32 = 5; // 500% of 30d average
 const CANCEL_VELOCITY_MIN_TRIGGER: u32 = 25; // Ignore small protocols / cold start noise
 
+// --- Recurring Billing Sweep Bounds ---
+/// Hard upper bound on items processed per recurring-billing sweep call.
+///
+/// Caps iteration in `get_subscriptions_paginated` and
+/// `get_active_subscriptions` so that a single transaction cannot exceed
+/// Soroban's CPU/instruction budget on subscriber indexes that have grown
+/// large over time. Callers requesting more than this in one call have
+/// their request silently clamped; full enumeration must walk the cursor
+/// across multiple transactions.
+pub const MAX_SWEEP_PAGE_SIZE: u32 = 50;
+
 // --- Merchant Registry and KYC Whitelisting Constants ---
 pub(crate) const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
 const MERCHANT_KYC_VALIDITY: u64 = 365 * 24 * 60 * 60; // 1 year validity for KYC credentials
@@ -4132,25 +4143,14 @@ impl SubStreamContract {
     // Issue #127: get_active_subscriptions Read-Only Query
     // =========================================================================
 
-    /// Read-only query to get all active subscriptions for a subscriber
-    /// Returns comprehensive data ready for UI rendering
+    /// Returns up to `MAX_SWEEP_PAGE_SIZE` of a subscriber's active subscriptions.
+    ///
+    /// Iteration is bounded so that a single recurring-billing sweep cannot
+    /// exceed Soroban's CPU/instruction budget on a long-lived index. Callers
+    /// that need to enumerate all subscriptions must walk the cursor exposed
+    /// by `get_subscriptions_paginated` across multiple transactions.
     pub fn get_active_subscriptions(env: Env, subscriber: Address) -> soroban_sdk::Vec<Subscription> {
-        let index_key = DataKey::SubscriberIndex(subscriber.clone());
-        let creators: soroban_sdk::Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&index_key)
-            .unwrap_or(soroban_sdk::Vec::new(&env));
-
-        let mut active_subs = soroban_sdk::vec![&env];
-        for i in 0..creators.len() {
-            let creator = creators.get(i).unwrap();
-            let key = subscription_key(&subscriber, &creator);
-            if subscription_exists(&env, &key) {
-                active_subs.push_back(get_subscription(&env, &key));
-            }
-        }
-        active_subs
+        Self::get_subscriptions_paginated(env, subscriber, 0, MAX_SWEEP_PAGE_SIZE).items
     }
 
     // =========================================================================
@@ -4159,15 +4159,20 @@ impl SubStreamContract {
 
     /// Returns a paginated slice of a subscriber's active subscriptions.
     /// `cursor` is the 0-based index to start from; `limit` caps the page size.
-    /// Returns `next_cursor` = cursor + items_returned and `has_more` flag.
+    /// Returns `next_cursor` = cursor + items_inspected and `has_more` flag.
     /// Out-of-bounds cursors return an empty page without panicking.
+    ///
+    /// `limit` is silently clamped to `MAX_SWEEP_PAGE_SIZE` so a single
+    /// recurring-billing sweep can never exceed Soroban's CPU/instruction
+    /// budget on a long-lived index.
     pub fn get_subscriptions_paginated(
         env: Env,
         subscriber: Address,
         cursor: u32,
         limit: u32,
     ) -> SubscriptionPage {
-        if limit == 0 {
+        let safe_limit = limit.min(MAX_SWEEP_PAGE_SIZE);
+        if safe_limit == 0 {
             return SubscriptionPage {
                 items: soroban_sdk::Vec::new(&env),
                 next_cursor: cursor,
@@ -4192,7 +4197,7 @@ impl SubStreamContract {
         }
 
         let mut items = soroban_sdk::Vec::new(&env);
-        let end = (cursor + limit).min(total);
+        let end = cursor.saturating_add(safe_limit).min(total);
         for i in cursor..end {
             let creator = creators.get(i).unwrap();
             let key = subscription_key(&subscriber, &creator);

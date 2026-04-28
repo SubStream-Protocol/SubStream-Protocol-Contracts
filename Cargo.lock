@@ -1189,6 +1189,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pull-tester"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
