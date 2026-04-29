@@ -886,6 +886,14 @@ pub struct DelegateRevoked {
 }
 
 #[contractevent]
+pub struct FamilyVaultSignerRotated {
+    #[topic] pub vault_id: Address,
+    #[topic] pub old_signer: Address,
+    #[topic] pub new_signer: Address,
+    pub rotated_at: u64,
+}
+
+#[contractevent]
 pub struct VacationModeActivated {
     #[topic] pub merchant: Address,
     pub activated_at: u64,
@@ -3846,6 +3854,59 @@ impl SubStreamContract {
         .publish(&env);
     }
 
+    /// Rotate an authorized multi-sig signer for a family vault.
+    pub fn rotate_family_vault_signer(
+        env: Env,
+        vault_id: Address,
+        current_signer: Address,
+        new_signer: Address,
+    ) {
+        let vault_key = DataKey::FamilyVault(vault_id.clone());
+        let mut vault_config: FamilyVaultConfig = env
+            .storage()
+            .persistent()
+            .get(&vault_key)
+            .expect("vault not found");
+
+        vault_config.owner.require_auth();
+
+        if !vault_config.is_active {
+            panic!("vault is not active");
+        }
+        if current_signer == new_signer {
+            panic!("current and new signer must differ");
+        }
+        if vault_config.signers.contains(&new_signer) {
+            panic!("new signer already authorized");
+        }
+
+        let mut replacement_occurred = false;
+        let mut rotated_signers = soroban_sdk::Vec::new(&env);
+        for i in 0..vault_config.signers.len() {
+            let signer = vault_config.signers.get(i).unwrap();
+            if signer == &current_signer {
+                rotated_signers.push_back(new_signer.clone());
+                replacement_occurred = true;
+            } else {
+                rotated_signers.push_back(signer.clone());
+            }
+        }
+        if !replacement_occurred {
+            panic!("signer not found");
+        }
+
+        vault_config.signers = rotated_signers;
+        env.storage().persistent().set(&vault_key, &vault_config);
+
+        FamilyVaultSignerRotated {
+            vault_id,
+            old_signer: current_signer,
+            new_signer,
+            rotated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
     /// Subscribe to a merchant using vault funds (delegate call)
     pub fn vault_subscribe(
         env: Env,
@@ -5934,6 +5995,8 @@ pub fn is_reentrancy_guard_active(env: &Env) -> bool {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_family_vault_key_rotation;
 #[cfg(test)]
 
 mod test_enhanced_subscriptions;
