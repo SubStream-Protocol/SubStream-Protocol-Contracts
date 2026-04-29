@@ -4,7 +4,7 @@ use soroban_sdk::{Address, Env, vec, String};
 use crate::{
     SubStreamContract, ProtocolFeeConfig, ProtocolFeeUpdateProposal, DataKey,
     PROTOCOL_FEE_MAX_BPS, PROTOCOL_FEE_TIMELOCK_DURATION, DEFAULT_PROTOCOL_FEE_BPS,
-    DAO_MULTISIG_THRESHOLD, SECURITY_COUNCIL_SIZE,
+    DAO_MULTISIG_THRESHOLD, SECURITY_COUNCIL_SIZE, MAX_REASON_LENGTH,
 };
 
 #[test]
@@ -551,4 +551,353 @@ fn test_stroop_distribution_precision() {
     assert_eq!(dust_protocol_fee, 49);
     assert_eq!(dust_creator_amount, 950);
     assert_eq!(dust_protocol_fee + dust_creator_amount, dust_prone_amount);
+}
+
+#[test]
+fn test_empty_reason_rejected() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SubStreamContract);
+    let admin = Address::random(&env);
+    let kyc_issuer = Address::random(&env);
+    let security_council = vec![&env,
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+    ];
+    let council_member = security_council.get(0).unwrap();
+    
+    // Initialize contract with security council
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council.clone(), kyc_issuer);
+    
+    // Initialize protocol fee
+    SubStreamContract::initialize_protocol_fee(env.clone(), admin.clone());
+    
+    // Try to propose with empty reason
+    let empty_reason = String::from_str(&env, "");
+    let result = env.try_invoke_contract::<u64, _>(
+        &SubStreamContract::propose_protocol_fee_update,
+        &env,
+        &council_member,
+        &300,
+        &empty_reason,
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_reason_too_long_rejected() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SubStreamContract);
+    let admin = Address::random(&env);
+    let kyc_issuer = Address::random(&env);
+    let security_council = vec![&env,
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+    ];
+    let council_member = security_council.get(0).unwrap();
+    
+    // Initialize contract with security council
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council.clone(), kyc_issuer);
+    
+    // Initialize protocol fee
+    SubStreamContract::initialize_protocol_fee(env.clone(), admin.clone());
+    
+    // Try to propose with reason exceeding max length
+    let long_reason = String::from_str(&env, &"a".repeat(MAX_REASON_LENGTH as usize + 1));
+    let result = env.try_invoke_contract::<u64, _>(
+        &SubStreamContract::propose_protocol_fee_update,
+        &env,
+        &council_member,
+        &300,
+        &long_reason,
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_veto_with_empty_reason_rejected() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SubStreamContract);
+    let admin = Address::random(&env);
+    let kyc_issuer = Address::random(&env);
+    let security_council = vec![&env,
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+    ];
+    
+    // Initialize contract with security council
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council.clone(), kyc_issuer);
+    
+    // Initialize protocol fee
+    SubStreamContract::initialize_protocol_fee(env.clone(), admin.clone());
+    
+    // Propose fee increase
+    let council_member = security_council.get(0).unwrap();
+    let reason = String::from_str(&env, "Increase fee");
+    let proposal_id = SubStreamContract::propose_protocol_fee_update(
+        env.clone(),
+        council_member.clone(),
+        300,
+        reason,
+    );
+    
+    // Try to veto with empty reason
+    let veto_member = security_council.get(1).unwrap();
+    let empty_veto_reason = String::from_str(&env, "");
+    let result = env.try_invoke_contract::<(), _>(
+        &SubStreamContract::security_council_veto_fee,
+        &env,
+        &veto_member,
+        &proposal_id,
+        &empty_veto_reason,
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_veto_reason_too_long_rejected() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SubStreamContract);
+    let admin = Address::random(&env);
+    let kyc_issuer = Address::random(&env);
+    let security_council = vec![&env,
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+    ];
+    
+    // Initialize contract with security council
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council.clone(), kyc_issuer);
+    
+    // Initialize protocol fee
+    SubStreamContract::initialize_protocol_fee(env.clone(), admin.clone());
+    
+    // Propose fee increase
+    let council_member = security_council.get(0).unwrap();
+    let reason = String::from_str(&env, "Increase fee");
+    let proposal_id = SubStreamContract::propose_protocol_fee_update(
+        env.clone(),
+        council_member.clone(),
+        300,
+        reason,
+    );
+    
+    // Try to veto with reason exceeding max length
+    let veto_member = security_council.get(1).unwrap();
+    let long_veto_reason = String::from_str(&env, &"a".repeat(MAX_REASON_LENGTH as usize + 1));
+    let result = env.try_invoke_contract::<(), _>(
+        &SubStreamContract::security_council_veto_fee,
+        &env,
+        &veto_member,
+        &proposal_id,
+        &long_veto_reason,
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_vote_on_expired_proposal_rejected() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SubStreamContract);
+    let admin = Address::random(&env);
+    let kyc_issuer = Address::random(&env);
+    let security_council = vec![&env,
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+    ];
+    
+    // Initialize contract with security council
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council.clone(), kyc_issuer);
+    
+    // Initialize protocol fee
+    SubStreamContract::initialize_protocol_fee(env.clone(), admin.clone());
+    
+    // Propose fee increase
+    let council_member = security_council.get(0).unwrap();
+    let reason = String::from_str(&env, "Increase fee");
+    let proposal_id = SubStreamContract::propose_protocol_fee_update(
+        env.clone(),
+        council_member.clone(),
+        300,
+        reason,
+    );
+    
+    // Fast forward past proposal expiry (30 days)
+    let proposal = SubStreamContract::get_protocol_fee_proposal(env.clone(), proposal_id);
+    env.ledger().set_timestamp(proposal.proposed_at + 31 * 24 * 60 * 60);
+    
+    // Try to vote on expired proposal
+    let voter = security_council.get(1).unwrap();
+    let result = env.try_invoke_contract::<(), _>(
+        &SubStreamContract::vote_protocol_fee_update,
+        &env,
+        &voter,
+        &proposal_id,
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_execute_expired_proposal_rejected() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SubStreamContract);
+    let admin = Address::random(&env);
+    let kyc_issuer = Address::random(&env);
+    let security_council = vec![&env,
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+    ];
+    
+    // Initialize contract with security council
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council.clone(), kyc_issuer);
+    
+    // Initialize protocol fee
+    SubStreamContract::initialize_protocol_fee(env.clone(), admin.clone());
+    
+    // Propose fee decrease (immediate execution)
+    let council_member = security_council.get(0).unwrap();
+    let reason = String::from_str(&env, "Decrease fee");
+    let proposal_id = SubStreamContract::propose_protocol_fee_update(
+        env.clone(),
+        council_member.clone(),
+        100,
+        reason,
+    );
+    
+    // Get 3 votes to reach consensus
+    for i in 0..DAO_MULTISIG_THRESHOLD {
+        let voter = security_council.get(i as usize).unwrap();
+        SubStreamContract::vote_protocol_fee_update(env.clone(), voter.clone(), proposal_id);
+    }
+    
+    // Fast forward past proposal expiry (30 days)
+    let proposal = SubStreamContract::get_protocol_fee_proposal(env.clone(), proposal_id);
+    env.ledger().set_timestamp(proposal.proposed_at + 31 * 24 * 60 * 60);
+    
+    // Try to execute expired proposal
+    let executor = Address::random(&env);
+    let result = env.try_invoke_contract::<(), _>(
+        &SubStreamContract::execute_protocol_fee_update,
+        &env,
+        &executor,
+        &proposal_id,
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_veto_expired_proposal_rejected() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SubStreamContract);
+    let admin = Address::random(&env);
+    let kyc_issuer = Address::random(&env);
+    let security_council = vec![&env,
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+    ];
+    
+    // Initialize contract with security council
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council.clone(), kyc_issuer);
+    
+    // Initialize protocol fee
+    SubStreamContract::initialize_protocol_fee(env.clone(), admin.clone());
+    
+    // Propose fee increase
+    let council_member = security_council.get(0).unwrap();
+    let reason = String::from_str(&env, "Increase fee");
+    let proposal_id = SubStreamContract::propose_protocol_fee_update(
+        env.clone(),
+        council_member.clone(),
+        300,
+        reason,
+    );
+    
+    // Fast forward past proposal expiry (30 days)
+    let proposal = SubStreamContract::get_protocol_fee_proposal(env.clone(), proposal_id);
+    env.ledger().set_timestamp(proposal.proposed_at + 31 * 24 * 60 * 60);
+    
+    // Try to veto expired proposal
+    let veto_member = security_council.get(1).unwrap();
+    let veto_reason = String::from_str(&env, "Too late");
+    let result = env.try_invoke_contract::<(), _>(
+        &SubStreamContract::security_council_veto_fee,
+        &env,
+        &veto_member,
+        &proposal_id,
+        &veto_reason,
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_initialize_fee_without_contract_initialization_rejected() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SubStreamContract);
+    let admin = Address::random(&env);
+    
+    // Try to initialize protocol fee without initializing contract
+    let result = env.try_invoke_contract::<(), _>(
+        &SubStreamContract::initialize_protocol_fee,
+        &env,
+        &admin,
+    );
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_propose_without_contract_initialization_rejected() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SubStreamContract);
+    let admin = Address::random(&env);
+    let kyc_issuer = Address::random(&env);
+    let security_council = vec![&env,
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+        Address::random(&env),
+    ];
+    let council_member = security_council.get(0).unwrap();
+    
+    // Initialize contract with security council
+    SubStreamContract::initialize(env.clone(), admin.clone(), security_council.clone(), kyc_issuer);
+    
+    // Try to propose without initializing protocol fee
+    let reason = String::from_str(&env, "Increase fee");
+    let result = env.try_invoke_contract::<u64, _>(
+        &SubStreamContract::propose_protocol_fee_update,
+        &env,
+        &council_member,
+        &300,
+        &reason,
+    );
+    
+    assert!(result.is_err());
 }

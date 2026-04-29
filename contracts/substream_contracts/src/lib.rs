@@ -88,6 +88,8 @@ const TTL_BUMP_AMOUNT: u32 = 518400; // Assuming ~30 days in ledgers for example
 const PROTOCOL_FEE_MAX_BPS: u32 = 500; // Maximum 5% fee
 const PROTOCOL_FEE_TIMELOCK_DURATION: u64 = 7 * 24 * 60 * 60; // 7 days for fee increases
 const DEFAULT_PROTOCOL_FEE_BPS: u32 = 200; // Default 2% fee
+const PROTOCOL_FEE_PROPOSAL_EXPIRY: u64 = 30 * 24 * 60 * 60; // 30 days for proposal expiry
+const MAX_REASON_LENGTH: u32 = 500; // Maximum length for reason strings
 
 // --- SLA Circuit Breaker Constants ---
 const SLA_THRESHOLD_BPS: u32 = 9990; // 99.9% uptime threshold (in basis points)
@@ -2411,8 +2413,16 @@ impl SubStreamContract {
     /// Initialize protocol fee configuration with default values.
     /// Can only be called by the contract admin.
     pub fn initialize_protocol_fee(env: Env, admin: Address) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "initialize_protocol_fee");
+        
         admin.require_auth();
         require_contract_admin(&env, &admin);
+
+        // Verify contract is properly initialized
+        if !is_contract_initialized(&env) {
+            panic!("contract not initialized");
+        }
 
         // Check if already initialized
         if env.storage().persistent().has(&DataKey::ProtocolFeeConfig) {
@@ -2451,12 +2461,16 @@ impl SubStreamContract {
     /// - New fee exceeds maximum (500 bps)
     /// - New fee equals current fee (no change)
     /// - Contract is not initialized
+    /// - Reason is empty
     pub fn propose_protocol_fee_update(
         env: Env,
         proposer: Address,
         new_fee_bps: u32,
         reason: soroban_sdk::String,
     ) -> u64 {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "propose_protocol_fee_update");
+        
         proposer.require_auth();
 
         // Verify contract is initialized
@@ -2480,6 +2494,14 @@ impl SubStreamContract {
         }
         if new_fee_bps == current_config.current_fee_bps {
             panic!("no change in fee");
+        }
+        
+        // Validate reason is not empty and within length limit
+        if reason.len() == 0 {
+            panic!("reason cannot be empty");
+        }
+        if reason.len() > MAX_REASON_LENGTH as usize {
+            panic!("reason exceeds maximum length");
         }
 
         // Generate unique proposal ID
@@ -2537,6 +2559,9 @@ impl SubStreamContract {
     /// - Proposal not found or no longer active
     /// - Already voted on this proposal
     pub fn vote_protocol_fee_update(env: Env, voter: Address, proposal_id: u64) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "vote_protocol_fee_update");
+        
         voter.require_auth();
 
         // Verify voter is Security Council member
@@ -2552,6 +2577,11 @@ impl SubStreamContract {
         // Check if proposal is still pending
         if proposal.executed || proposal.canceled {
             panic!("proposal no longer active");
+        }
+        
+        // Check if proposal has expired
+        if is_proposal_expired(&env, proposal.proposed_at) {
+            panic!("proposal has expired");
         }
 
         // Check if already voted
@@ -2594,6 +2624,9 @@ impl SubStreamContract {
     /// - Timelock not expired (for fee increases)
     /// - Consensus threshold not reached
     pub fn execute_protocol_fee_update(env: Env, executor: Address, proposal_id: u64) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "execute_protocol_fee_update");
+        
         executor.require_auth();
 
         let proposal_key = DataKey::ProtocolFeeUpdateProposal(proposal_id);
@@ -2604,6 +2637,11 @@ impl SubStreamContract {
         // Verify proposal is ready for execution
         if proposal.executed || proposal.canceled {
             panic!("proposal no longer active");
+        }
+        
+        // Check if proposal has expired
+        if is_proposal_expired(&env, proposal.proposed_at) {
+            panic!("proposal has expired");
         }
 
         // Check timelock (for fee increases)
@@ -2644,12 +2682,16 @@ impl SubStreamContract {
     /// Panics if:
     /// - Caller is not a security council member
     /// - Proposal not found or already executed/canceled
+    /// - Veto reason is empty
     pub fn security_council_veto_fee(
         env: Env,
         council_member: Address,
         proposal_id: u64,
         veto_reason: soroban_sdk::String,
     ) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "security_council_veto_fee");
+        
         council_member.require_auth();
 
         // Verify council member authority
@@ -2665,6 +2707,19 @@ impl SubStreamContract {
         // Can only veto pending proposals
         if proposal.executed || proposal.canceled {
             panic!("cannot veto executed or canceled proposal");
+        }
+        
+        // Check if proposal has expired
+        if is_proposal_expired(&env, proposal.proposed_at) {
+            panic!("proposal has expired");
+        }
+        
+        // Validate veto reason is not empty and within length limit
+        if veto_reason.len() == 0 {
+            panic!("veto reason cannot be empty");
+        }
+        if veto_reason.len() > MAX_REASON_LENGTH as usize {
+            panic!("veto reason exceeds maximum length");
         }
 
         // Cancel the proposal
@@ -5498,6 +5553,12 @@ fn is_security_council_member(env: &Env, address: &Address) -> bool {
     }
 }
 
+/// Check if a proposal has expired (beyond the validity period).
+fn is_proposal_expired(env: &Env, proposed_at: u64) -> bool {
+    let now = env.ledger().timestamp();
+    now > proposed_at.saturating_add(PROTOCOL_FEE_PROPOSAL_EXPIRY)
+}
+
 /// Check if an address is authorized to propose governance changes.
 /// Authorized proposers are security council members or the contract admin.
 fn is_authorized_proposer(env: &Env, address: &Address) -> bool {
@@ -5667,10 +5728,20 @@ fn execute_protocol_fee_update_internal(env: &Env, proposal_id: u64) {
         .get(&proposal_key)
         .expect("proposal not found");
 
+    // Double-check proposal is not already executed (defensive programming)
+    if proposal.executed {
+        panic!("proposal already executed");
+    }
+
     // Update the protocol fee config
     let mut fee_config: ProtocolFeeConfig = env.storage().persistent()
         .get(&DataKey::ProtocolFeeConfig)
         .expect("protocol fee not initialized");
+
+    // Validate the fee change is still valid (defensive check)
+    if proposal.new_fee_bps > PROTOCOL_FEE_MAX_BPS {
+        panic!("fee exceeds maximum");
+    }
 
     fee_config.current_fee_bps = proposal.new_fee_bps;
     fee_config.updated_by = env.current_contract_address();
