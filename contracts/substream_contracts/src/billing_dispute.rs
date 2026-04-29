@@ -688,11 +688,13 @@ fn resolve_dispute(
                 .set(&DataKey::CurrentFlowRate(merchant.clone()), &total_flow);
 
             crate::unregister_creator_support(env, merchant, subscriber);
+            crate::finalize_unsubscription_indices(env, subscriber, merchant);
 
             env.storage().persistent().remove(&sub_key);
             env.storage().temporary().remove(&sub_key);
         }
     }
+
 
     DisputeResolved {
         dispute_id,
