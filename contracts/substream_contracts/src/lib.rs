@@ -228,6 +228,10 @@ pub enum DataKey {
     ProtocolFeeConfig,
     ProtocolFeeUpdateProposal(u64),
     SecurityCouncilVetoFee(Address, u64), // (council_member, proposal_id)
+    SubscriberIndex(Address),
+    SubscriberHistoryIndex(Address),
+    Tombstone(Address, Address),
+    CanceledRecord(Address, Address),
 }
 
 #[contracttype]
@@ -837,6 +841,23 @@ pub struct SubscriptionPage {
     pub next_cursor: u32,
     pub has_more: bool,
 }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryItem {
+    pub creator: Address,
+    pub canceled_at: u64,
+    pub token: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryPage {
+    pub items: soroban_sdk::Vec<HistoryItem>,
+    pub next_cursor: u32,
+    pub has_more: bool,
+}
+
 
 
 
@@ -4198,13 +4219,18 @@ impl SubStreamContract {
             .unwrap_or(soroban_sdk::Vec::new(&env));
 
         let mut active_subs = soroban_sdk::vec![&env];
-        for i in 0..creators.len() {
+        let total = creators.len();
+        let limit = 100; // Hard cap for security (Issue #191)
+        let end = total.min(limit);
+
+        for i in 0..end {
             let creator = creators.get(i).unwrap();
             let key = subscription_key(&subscriber, &creator);
             if subscription_exists(&env, &key) {
                 active_subs.push_back(get_subscription(&env, &key));
             }
         }
+
         active_subs
     }
 
@@ -4260,6 +4286,65 @@ impl SubStreamContract {
         let has_more = next_cursor < total;
         SubscriptionPage { items, next_cursor, has_more }
     }
+
+    /// Read-only query to get canceled subscription history for a subscriber.
+    /// Returns paginated HistoryItem records.
+    pub fn get_subscription_history_paginated(
+        env: Env,
+        subscriber: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> HistoryPage {
+        if limit == 0 {
+            return HistoryPage {
+                items: soroban_sdk::Vec::new(&env),
+                next_cursor: cursor,
+                has_more: false,
+            };
+        }
+
+        let index_key = DataKey::SubscriberHistoryIndex(subscriber.clone());
+        let history: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        let total = history.len();
+        if cursor >= total {
+            return HistoryPage {
+                items: soroban_sdk::Vec::new(&env),
+                next_cursor: cursor,
+                has_more: false,
+            };
+        }
+
+        let mut items = soroban_sdk::Vec::new(&env);
+        let end = (cursor + limit).min(total);
+
+        // Bounded loop: iteration is explicitly capped by `limit`
+        for i in cursor..end {
+            let creator = history.get(i).unwrap();
+            let canceled_key = DataKey::CanceledRecord(subscriber.clone(), creator.clone());
+            
+            if let Some(record) = env.storage().persistent().get::<CanceledRecord>(&canceled_key) {
+                items.push_back(HistoryItem {
+                    creator,
+                    canceled_at: record.canceled_at,
+                    token: record.token,
+                });
+            }
+        }
+
+        let next_cursor = end;
+        let has_more = next_cursor < total;
+        HistoryPage {
+            items,
+            next_cursor,
+            has_more,
+        }
+    }
+
 
     // =========================================================================
     // Issue #131: check_allowance_health Pre-flight Check
@@ -4861,12 +4946,51 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
         &canceled_record,
     );
 
-    // Issue #129: remove creator from subscriber's index
-    let index_key = DataKey::SubscriberIndex(beneficiary.clone());
+    // Issue #129 & #191: Handle index updates (active removal, history addition)
+    finalize_unsubscription_indices(env, beneficiary, stream_id);
+
+
+    record_protocol_cancellation(env);
+    Unsubscribed {
+        subscriber: beneficiary.clone(),
+        creator: stream_id.clone(),
+    }
+    .publish(env);
+}
+
+/// Internal helper to manage index updates during any form of unsubscription (manual or dispute).
+/// Ensures the active index is pruned and the history index is updated.
+pub(crate) fn finalize_unsubscription_indices(
+    env: &Env,
+    subscriber: &Address,
+    creator: &Address,
+) {
+    // 1. Maintain per-subscriber history index for pagination
+    let history_index_key = DataKey::SubscriberHistoryIndex(subscriber.clone());
+    let mut history_index: soroban_sdk::Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&history_index_key)
+        .unwrap_or(soroban_sdk::Vec::new(env));
+
+    let mut exists = false;
+    for i in 0..history_index.len() {
+        if history_index.get(i).unwrap() == *creator {
+            exists = true;
+            break;
+        }
+    }
+    if !exists {
+        history_index.push_back(creator.clone());
+        env.storage().persistent().set(&history_index_key, &history_index);
+    }
+
+    // 2. Remove creator from subscriber's active index
+    let index_key = DataKey::SubscriberIndex(subscriber.clone());
     if let Some(mut index) = env.storage().persistent().get::<soroban_sdk::Vec<Address>>(&index_key) {
         let mut remove_idx: Option<u32> = None;
         for i in 0..index.len() {
-            if index.get(i).unwrap() == *stream_id {
+            if index.get(i).unwrap() == *creator {
                 remove_idx = Some(i);
                 break;
             }
@@ -4876,14 +5000,8 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
             env.storage().persistent().set(&index_key, &index);
         }
     }
-
-    record_protocol_cancellation(env);
-    Unsubscribed {
-        subscriber: beneficiary.clone(),
-        creator: stream_id.clone(),
-    }
-    .publish(env);
 }
+
 
 #[allow(clippy::too_many_arguments)]
 fn subscribe_core(
