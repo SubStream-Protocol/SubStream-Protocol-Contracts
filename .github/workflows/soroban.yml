@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,7 +47,7 @@ jobs:
 
       - name: Post Automated Comment on PR
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v6
+        uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |

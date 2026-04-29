@@ -15,7 +15,7 @@ jobs:
         working-directory: contracts/substream_contracts
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable

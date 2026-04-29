@@ -88,6 +88,8 @@ const TTL_BUMP_AMOUNT: u32 = 518400; // Assuming ~30 days in ledgers for example
 const PROTOCOL_FEE_MAX_BPS: u32 = 500; // Maximum 5% fee
 const PROTOCOL_FEE_TIMELOCK_DURATION: u64 = 7 * 24 * 60 * 60; // 7 days for fee increases
 const DEFAULT_PROTOCOL_FEE_BPS: u32 = 200; // Default 2% fee
+const PROTOCOL_FEE_PROPOSAL_EXPIRY: u64 = 30 * 24 * 60 * 60; // 30 days for proposal expiry
+const MAX_REASON_LENGTH: u32 = 500; // Maximum length for reason strings
 
 // --- SLA Circuit Breaker Constants ---
 const SLA_THRESHOLD_BPS: u32 = 9990; // 99.9% uptime threshold (in basis points)
@@ -237,6 +239,10 @@ pub enum DataKey {
     ProtocolFeeConfig,
     ProtocolFeeUpdateProposal(u64),
     SecurityCouncilVetoFee(Address, u64), // (council_member, proposal_id)
+    SubscriberIndex(Address),
+    SubscriberHistoryIndex(Address),
+    Tombstone(Address, Address),
+    CanceledRecord(Address, Address),
 }
 
 #[contracttype]
@@ -847,6 +853,23 @@ pub struct SubscriptionPage {
     pub has_more: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryItem {
+    pub creator: Address,
+    pub canceled_at: u64,
+    pub token: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryPage {
+    pub items: soroban_sdk::Vec<HistoryItem>,
+    pub next_cursor: u32,
+    pub has_more: bool,
+}
+
+
 
 
 #[contractevent]
@@ -871,6 +894,14 @@ pub struct DelegateRevoked {
     #[topic] pub vault_id: Address,
     #[topic] pub delegate: Address,
     pub revoked_at: u64,
+}
+
+#[contractevent]
+pub struct FamilyVaultSignerRotated {
+    #[topic] pub vault_id: Address,
+    #[topic] pub old_signer: Address,
+    #[topic] pub new_signer: Address,
+    pub rotated_at: u64,
 }
 
 #[contractevent]
@@ -2422,8 +2453,16 @@ impl SubStreamContract {
     /// Initialize protocol fee configuration with default values.
     /// Can only be called by the contract admin.
     pub fn initialize_protocol_fee(env: Env, admin: Address) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "initialize_protocol_fee");
+        
         admin.require_auth();
         require_contract_admin(&env, &admin);
+
+        // Verify contract is properly initialized
+        if !is_contract_initialized(&env) {
+            panic!("contract not initialized");
+        }
 
         // Check if already initialized
         if env.storage().persistent().has(&DataKey::ProtocolFeeConfig) {
@@ -2462,12 +2501,16 @@ impl SubStreamContract {
     /// - New fee exceeds maximum (500 bps)
     /// - New fee equals current fee (no change)
     /// - Contract is not initialized
+    /// - Reason is empty
     pub fn propose_protocol_fee_update(
         env: Env,
         proposer: Address,
         new_fee_bps: u32,
         reason: soroban_sdk::String,
     ) -> u64 {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "propose_protocol_fee_update");
+        
         proposer.require_auth();
 
         // Verify contract is initialized
@@ -2491,6 +2534,14 @@ impl SubStreamContract {
         }
         if new_fee_bps == current_config.current_fee_bps {
             panic!("no change in fee");
+        }
+        
+        // Validate reason is not empty and within length limit
+        if reason.len() == 0 {
+            panic!("reason cannot be empty");
+        }
+        if reason.len() > MAX_REASON_LENGTH as usize {
+            panic!("reason exceeds maximum length");
         }
 
         // Generate unique proposal ID
@@ -2548,6 +2599,9 @@ impl SubStreamContract {
     /// - Proposal not found or no longer active
     /// - Already voted on this proposal
     pub fn vote_protocol_fee_update(env: Env, voter: Address, proposal_id: u64) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "vote_protocol_fee_update");
+        
         voter.require_auth();
 
         // Verify voter is Security Council member
@@ -2563,6 +2617,11 @@ impl SubStreamContract {
         // Check if proposal is still pending
         if proposal.executed || proposal.canceled {
             panic!("proposal no longer active");
+        }
+        
+        // Check if proposal has expired
+        if is_proposal_expired(&env, proposal.proposed_at) {
+            panic!("proposal has expired");
         }
 
         // Check if already voted
@@ -2605,6 +2664,9 @@ impl SubStreamContract {
     /// - Timelock not expired (for fee increases)
     /// - Consensus threshold not reached
     pub fn execute_protocol_fee_update(env: Env, executor: Address, proposal_id: u64) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "execute_protocol_fee_update");
+        
         executor.require_auth();
 
         let proposal_key = DataKey::ProtocolFeeUpdateProposal(proposal_id);
@@ -2615,6 +2677,11 @@ impl SubStreamContract {
         // Verify proposal is ready for execution
         if proposal.executed || proposal.canceled {
             panic!("proposal no longer active");
+        }
+        
+        // Check if proposal has expired
+        if is_proposal_expired(&env, proposal.proposed_at) {
+            panic!("proposal has expired");
         }
 
         // Check timelock (for fee increases)
@@ -2655,12 +2722,16 @@ impl SubStreamContract {
     /// Panics if:
     /// - Caller is not a security council member
     /// - Proposal not found or already executed/canceled
+    /// - Veto reason is empty
     pub fn security_council_veto_fee(
         env: Env,
         council_member: Address,
         proposal_id: u64,
         veto_reason: soroban_sdk::String,
     ) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "security_council_veto_fee");
+        
         council_member.require_auth();
 
         // Verify council member authority
@@ -2676,6 +2747,19 @@ impl SubStreamContract {
         // Can only veto pending proposals
         if proposal.executed || proposal.canceled {
             panic!("cannot veto executed or canceled proposal");
+        }
+        
+        // Check if proposal has expired
+        if is_proposal_expired(&env, proposal.proposed_at) {
+            panic!("proposal has expired");
+        }
+        
+        // Validate veto reason is not empty and within length limit
+        if veto_reason.len() == 0 {
+            panic!("veto reason cannot be empty");
+        }
+        if veto_reason.len() > MAX_REASON_LENGTH as usize {
+            panic!("veto reason exceeds maximum length");
         }
 
         // Cancel the proposal
@@ -3781,6 +3865,59 @@ impl SubStreamContract {
         .publish(&env);
     }
 
+    /// Rotate an authorized multi-sig signer for a family vault.
+    pub fn rotate_family_vault_signer(
+        env: Env,
+        vault_id: Address,
+        current_signer: Address,
+        new_signer: Address,
+    ) {
+        let vault_key = DataKey::FamilyVault(vault_id.clone());
+        let mut vault_config: FamilyVaultConfig = env
+            .storage()
+            .persistent()
+            .get(&vault_key)
+            .expect("vault not found");
+
+        vault_config.owner.require_auth();
+
+        if !vault_config.is_active {
+            panic!("vault is not active");
+        }
+        if current_signer == new_signer {
+            panic!("current and new signer must differ");
+        }
+        if vault_config.signers.contains(&new_signer) {
+            panic!("new signer already authorized");
+        }
+
+        let mut replacement_occurred = false;
+        let mut rotated_signers = soroban_sdk::Vec::new(&env);
+        for i in 0..vault_config.signers.len() {
+            let signer = vault_config.signers.get(i).unwrap();
+            if signer == &current_signer {
+                rotated_signers.push_back(new_signer.clone());
+                replacement_occurred = true;
+            } else {
+                rotated_signers.push_back(signer.clone());
+            }
+        }
+        if !replacement_occurred {
+            panic!("signer not found");
+        }
+
+        vault_config.signers = rotated_signers;
+        env.storage().persistent().set(&vault_key, &vault_config);
+
+        FamilyVaultSignerRotated {
+            vault_id,
+            old_signer: current_signer,
+            new_signer,
+            rotated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
     /// Subscribe to a merchant using vault funds (delegate call)
     pub fn vault_subscribe(
         env: Env,
@@ -4210,6 +4347,65 @@ impl SubStreamContract {
         let has_more = next_cursor < total;
         SubscriptionPage { items, next_cursor, has_more }
     }
+
+    /// Read-only query to get canceled subscription history for a subscriber.
+    /// Returns paginated HistoryItem records.
+    pub fn get_subscription_history_paginated(
+        env: Env,
+        subscriber: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> HistoryPage {
+        if limit == 0 {
+            return HistoryPage {
+                items: soroban_sdk::Vec::new(&env),
+                next_cursor: cursor,
+                has_more: false,
+            };
+        }
+
+        let index_key = DataKey::SubscriberHistoryIndex(subscriber.clone());
+        let history: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&index_key)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        let total = history.len();
+        if cursor >= total {
+            return HistoryPage {
+                items: soroban_sdk::Vec::new(&env),
+                next_cursor: cursor,
+                has_more: false,
+            };
+        }
+
+        let mut items = soroban_sdk::Vec::new(&env);
+        let end = (cursor + limit).min(total);
+
+        // Bounded loop: iteration is explicitly capped by `limit`
+        for i in cursor..end {
+            let creator = history.get(i).unwrap();
+            let canceled_key = DataKey::CanceledRecord(subscriber.clone(), creator.clone());
+            
+            if let Some(record) = env.storage().persistent().get::<CanceledRecord>(&canceled_key) {
+                items.push_back(HistoryItem {
+                    creator,
+                    canceled_at: record.canceled_at,
+                    token: record.token,
+                });
+            }
+        }
+
+        let next_cursor = end;
+        let has_more = next_cursor < total;
+        HistoryPage {
+            items,
+            next_cursor,
+            has_more,
+        }
+    }
+
 
     // =========================================================================
     // Issue #131: check_allowance_health Pre-flight Check
@@ -4811,12 +5007,51 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
         &canceled_record,
     );
 
-    // Issue #129: remove creator from subscriber's index
-    let index_key = DataKey::SubscriberIndex(beneficiary.clone());
+    // Issue #129 & #191: Handle index updates (active removal, history addition)
+    finalize_unsubscription_indices(env, beneficiary, stream_id);
+
+
+    record_protocol_cancellation(env);
+    Unsubscribed {
+        subscriber: beneficiary.clone(),
+        creator: stream_id.clone(),
+    }
+    .publish(env);
+}
+
+/// Internal helper to manage index updates during any form of unsubscription (manual or dispute).
+/// Ensures the active index is pruned and the history index is updated.
+pub(crate) fn finalize_unsubscription_indices(
+    env: &Env,
+    subscriber: &Address,
+    creator: &Address,
+) {
+    // 1. Maintain per-subscriber history index for pagination
+    let history_index_key = DataKey::SubscriberHistoryIndex(subscriber.clone());
+    let mut history_index: soroban_sdk::Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&history_index_key)
+        .unwrap_or(soroban_sdk::Vec::new(env));
+
+    let mut exists = false;
+    for i in 0..history_index.len() {
+        if history_index.get(i).unwrap() == *creator {
+            exists = true;
+            break;
+        }
+    }
+    if !exists {
+        history_index.push_back(creator.clone());
+        env.storage().persistent().set(&history_index_key, &history_index);
+    }
+
+    // 2. Remove creator from subscriber's active index
+    let index_key = DataKey::SubscriberIndex(subscriber.clone());
     if let Some(mut index) = env.storage().persistent().get::<soroban_sdk::Vec<Address>>(&index_key) {
         let mut remove_idx: Option<u32> = None;
         for i in 0..index.len() {
-            if index.get(i).unwrap() == *stream_id {
+            if index.get(i).unwrap() == *creator {
                 remove_idx = Some(i);
                 break;
             }
@@ -4826,14 +5061,8 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
             env.storage().persistent().set(&index_key, &index);
         }
     }
-
-    record_protocol_cancellation(env);
-    Unsubscribed {
-        subscriber: beneficiary.clone(),
-        creator: stream_id.clone(),
-    }
-    .publish(env);
 }
+
 
 #[allow(clippy::too_many_arguments)]
 fn subscribe_core(
@@ -5503,6 +5732,12 @@ fn is_security_council_member(env: &Env, address: &Address) -> bool {
     }
 }
 
+/// Check if a proposal has expired (beyond the validity period).
+fn is_proposal_expired(env: &Env, proposed_at: u64) -> bool {
+    let now = env.ledger().timestamp();
+    now > proposed_at.saturating_add(PROTOCOL_FEE_PROPOSAL_EXPIRY)
+}
+
 /// Check if an address is authorized to propose governance changes.
 /// Authorized proposers are security council members or the contract admin.
 fn is_authorized_proposer(env: &Env, address: &Address) -> bool {
@@ -5672,10 +5907,20 @@ fn execute_protocol_fee_update_internal(env: &Env, proposal_id: u64) {
         .get(&proposal_key)
         .expect("proposal not found");
 
+    // Double-check proposal is not already executed (defensive programming)
+    if proposal.executed {
+        panic!("proposal already executed");
+    }
+
     // Update the protocol fee config
     let mut fee_config: ProtocolFeeConfig = env.storage().persistent()
         .get(&DataKey::ProtocolFeeConfig)
         .expect("protocol fee not initialized");
+
+    // Validate the fee change is still valid (defensive check)
+    if proposal.new_fee_bps > PROTOCOL_FEE_MAX_BPS {
+        panic!("fee exceeds maximum");
+    }
 
     fee_config.current_fee_bps = proposal.new_fee_bps;
     fee_config.updated_by = env.current_contract_address();
@@ -5750,6 +5995,8 @@ pub fn is_reentrancy_guard_active(env: &Env) -> bool {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_family_vault_key_rotation;
 #[cfg(test)]
 
 mod test_enhanced_subscriptions;

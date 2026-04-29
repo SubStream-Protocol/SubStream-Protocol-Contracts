@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
     
     - name: Install Rust
       uses: actions-rs/toolchain@v1
@@ -20,7 +20,7 @@ jobs:
         override: true
     
     - name: Cache dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry
@@ -69,7 +69,7 @@ jobs:
         echo "Branch: ${{ github.ref_name }}" >> formal_verification_report.txt
     
     - name: Upload formal verification report
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: formal-verification-report
         path: contracts/substream_contracts/formal_verification_report.txt
@@ -118,7 +118,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
     
     - name: Install Rust
       uses: actions-rs/toolchain@v1
@@ -127,7 +127,7 @@ jobs:
         override: true
     
     - name: Cache dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry
@@ -163,7 +163,7 @@ jobs:
         echo "for institutional deployment readiness." >> comprehensive_report.txt
     
     - name: Upload comprehensive report
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: comprehensive-formal-verification-report
         path: contracts/substream_contracts/comprehensive_report.txt
@@ -173,7 +173,7 @@ jobs:
     needs: formal-verification
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
     
     - name: Validate security documentation
       run: |
