@@ -45,3 +45,10 @@ path = "fuzz_targets/micro_subscription_execution.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "billing_cycle_epoch_crossing"
+path = "fuzz_targets/billing_cycle_epoch_crossing.rs"
+test = false
+doc = false
+bench = false
