@@ -1,7 +1,6 @@
 #![no_std]
-use soroban_sdk::contractevent;
 use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Bytes, Env, Vec};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env, Vec};
 
 // Minimum flow duration: 24 hours in seconds (24 * 60 * 60 = 86400)
 const MINIMUM_FLOW_DURATION: u64 = 86400;
@@ -63,23 +62,6 @@ pub struct SubStreamContract;
 
 fn stream_key(subscriber: &Address, stream_id: &Address) -> DataKey {
     DataKey::Stream(subscriber.clone(), stream_id.clone())
-}
-
-fn validate_distribution(creators: &Vec<Address>, percentages: &Vec<u32>, expected: u32) {
-    let creators_len = creators.len();
-    if creators_len != expected {
-        panic!("creator count mismatch");
-    }
-    
-    let mut total_percentage: u32 = 0;
-    for i in 0..creators_len {
-        let percentage = percentages.get(i as u32).unwrap();
-        total_percentage += percentage;
-    }
-    
-    if total_percentage != 100 {
-        panic!("percentages must sum to 100");
-    }
 }
 
 fn stream_exists(env: &Env, key: &DataKey) -> bool {
@@ -353,14 +335,9 @@ impl SubStreamContract {
         stream.tier.rate_per_second = new_rate_per_second;
         set_stream(&env, &key, &stream);
 
-        env.events().publish(
-            TierChanged {
-                subscriber: subscriber.clone(),
-                creator: creator.clone(),
-                old_rate,
-                new_rate: new_rate_per_second,
-            }
-        );
+        // Emit TierChanged event using topics and data
+        let topics = (symbol_short!("tier_chg"), subscriber.clone(), creator.clone());
+        env.events().publish(topics, (old_rate, new_rate_per_second));
     }
 
     /// Collect from all active streams for a creator in a single call.
