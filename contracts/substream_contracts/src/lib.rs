@@ -335,9 +335,11 @@ impl SubStreamContract {
         stream.tier.rate_per_second = new_rate_per_second;
         set_stream(&env, &key, &stream);
 
-        // Emit TierChanged event using topics and data
-        let topics = (symbol_short!("tier_chg"), subscriber.clone(), creator.clone());
-        env.events().publish(topics, (old_rate, new_rate_per_second));
+        #[allow(deprecated)]
+        {
+            let topics = (symbol_short!("tier_chg"), subscriber.clone(), creator.clone());
+            env.events().publish(topics, (old_rate, new_rate_per_second));
+        }
     }
 
     /// Collect from all active streams for a creator in a single call.
@@ -458,11 +460,13 @@ impl SubStreamContract {
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&user, &creator, &amount);
         
-        // Emit TipReceived event
-        env.events().publish(
-            (user.clone(), creator.clone(), token.clone()),
-            amount,
-        );
+        #[allow(deprecated)]
+        {
+            env.events().publish(
+                (user.clone(), creator.clone(), token.clone()),
+                amount,
+            );
+        }
     }
 
     // Update total streamed amount for a subscriber-creator pair
@@ -495,20 +499,6 @@ fn add_subscriber_to_creator(env: &Env, creator: &Address, subscriber: &Address)
 
     subs.push_back(subscriber.clone());
     env.storage().persistent().set(&key, &subs);
-}
-
-fn remove_subscriber_from_creator(env: &Env, creator: &Address, subscriber: &Address) {
-    let key = DataKey::CreatorSubscribers(creator.clone());
-    let subs: Vec<Address> = env.storage().persistent().get(&key).unwrap_or(vec![env]);
-
-    let mut updated = vec![env];
-    for s in subs.iter() {
-        if s != *subscriber {
-            updated.push_back(s);
-        }
-    }
-
-    env.storage().persistent().set(&key, &updated);
 }
 
 // Internal implementations
@@ -699,14 +689,6 @@ fn cancel_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
         token_client.transfer(&env.current_contract_address(), subscriber, &stream.balance);
     }
     env.storage().persistent().remove(&key);
-}
-
-fn update_total_streamed(env: &Env, subscriber: &Address, creator: &Address, amount: i128) {
-    let key = DataKey::TotalStreamed(subscriber.clone(), creator.clone());
-    let current_total: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-    env.storage()
-        .persistent()
-        .set(&key, &(current_total + amount));
 }
 
 fn top_up_internal(env: &Env, subscriber: &Address, stream_id: &Address, amount: i128) {
