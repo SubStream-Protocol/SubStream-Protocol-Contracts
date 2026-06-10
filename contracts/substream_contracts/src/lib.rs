@@ -1,6 +1,9 @@
 #![no_std]
 use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env, Vec};
+use soroban_sdk::{
+    contract, contractevent, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env,
+    Vec,
+};
 
 // Minimum flow duration: 24 hours in seconds (24 * 60 * 60 = 86400)
 const MINIMUM_FLOW_DURATION: u64 = 86400;
@@ -196,9 +199,7 @@ impl SubStreamContract {
             return false;
         }
 
-        let trial_end = stream
-            .start_time
-            .saturating_add(stream.tier.trial_duration);
+        let trial_end = stream.start_time.saturating_add(stream.tier.trial_duration);
         let charge_start = if stream.last_collected > trial_end {
             stream.last_collected
         } else {
@@ -214,7 +215,7 @@ impl SubStreamContract {
         let potential_charge = elapsed
             .checked_mul(stream.tier.rate_per_second)
             .unwrap_or(0);
-        
+
         stream.balance > potential_charge
     }
 
@@ -323,7 +324,7 @@ impl SubStreamContract {
 
         let mut stream = get_stream(&env, &key);
         let old_rate = stream.tier.rate_per_second;
-        
+
         if old_rate == new_rate_per_second {
             return;
         }
@@ -337,8 +338,13 @@ impl SubStreamContract {
 
         #[allow(deprecated)]
         {
-            let topics = (symbol_short!("tier_chg"), subscriber.clone(), creator.clone());
-            env.events().publish(topics, (old_rate, new_rate_per_second));
+            let topics = (
+                symbol_short!("tier_chg"),
+                subscriber.clone(),
+                creator.clone(),
+            );
+            env.events()
+                .publish(topics, (old_rate, new_rate_per_second));
         }
     }
 
@@ -347,7 +353,11 @@ impl SubStreamContract {
     /// Returns the total amount collected across all processed streams.
     pub fn withdraw_all(env: Env, creator: Address, max_count: u32) -> i128 {
         let subs_key = DataKey::CreatorSubscribers(creator.clone());
-        let subs: Vec<Address> = env.storage().persistent().get(&subs_key).unwrap_or(vec![&env]);
+        let subs: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&subs_key)
+            .unwrap_or(vec![&env]);
 
         let mut total: i128 = 0;
         let limit = max_count.min(subs.len());
@@ -447,25 +457,23 @@ impl SubStreamContract {
     /// Transfers tokens directly from user to creator and emits TipReceived event
     pub fn tip(env: Env, user: Address, creator: Address, token: Address, amount: i128) {
         user.require_auth();
-        
+
         if amount <= 0 {
             panic!("amount must be positive");
         }
-        
+
         if user == creator {
             panic!("cannot tip yourself");
         }
-        
+
         // Direct transfer from user to creator
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&user, &creator, &amount);
-        
+
         #[allow(deprecated)]
         {
-            env.events().publish(
-                (user.clone(), creator.clone(), token.clone()),
-                amount,
-            );
+            env.events()
+                .publish((user.clone(), creator.clone(), token.clone()), amount);
         }
     }
 
@@ -572,9 +580,7 @@ fn distribute_and_collect(
         }
     }
 
-    let trial_end = stream
-        .start_time
-        .saturating_add(stream.tier.trial_duration);
+    let trial_end = stream.start_time.saturating_add(stream.tier.trial_duration);
     let charge_start = if stream.last_collected > trial_end {
         stream.last_collected
     } else {
