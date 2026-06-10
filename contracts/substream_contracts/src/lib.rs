@@ -135,6 +135,7 @@ fn validate_distribution(
 #[contractimpl]
 impl SubStreamContract {
     // Single-creator subscribe for backwards compatibility
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe(
         env: Env,
         subscriber: Address,
@@ -155,7 +156,7 @@ impl SubStreamContract {
         }
 
         let token_client = TokenClient::new(&env, &token);
-        token_client.transfer(&subscriber, &env.current_contract_address(), &amount);
+        token_client.transfer(&subscriber, env.current_contract_address(), &amount);
 
         let now = env.ledger().timestamp();
         let stream = Stream {
@@ -220,6 +221,7 @@ impl SubStreamContract {
     }
 
     // Minimal group wrappers
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe_group(
         env: Env,
         subscriber: Address,
@@ -510,6 +512,7 @@ fn add_subscriber_to_creator(env: &Env, creator: &Address, subscriber: &Address)
 }
 
 // Internal implementations
+#[allow(clippy::too_many_arguments)]
 fn subscribe_internal(
     env: &Env,
     subscriber: &Address,
@@ -529,7 +532,7 @@ fn subscribe_internal(
         panic!("stream already exists");
     }
     let token_client = TokenClient::new(env, token);
-    token_client.transfer(subscriber, &env.current_contract_address(), &amount);
+    token_client.transfer(subscriber, env.current_contract_address(), &amount);
     let now = env.ledger().timestamp();
     let stream = Stream {
         token: token.clone(),
@@ -708,7 +711,7 @@ fn top_up_internal(env: &Env, subscriber: &Address, stream_id: &Address, amount:
     }
     let mut stream: Stream = env.storage().persistent().get(&key).unwrap();
     let token_client = TokenClient::new(env, &stream.token);
-    token_client.transfer(subscriber, &env.current_contract_address(), &amount);
+    token_client.transfer(subscriber, env.current_contract_address(), &amount);
     stream.balance += amount;
     env.storage().persistent().set(&key, &stream);
 }
